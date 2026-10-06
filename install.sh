@@ -668,6 +668,67 @@ else
     warn "检查配置：cat $CONF_FILE"
 fi
 
+# --------------------------------------------------------- 自检 ----------
+step "安装结果自检"
+
+CHK_PASS=0
+CHK_FAIL=0
+
+chk() {
+    # $1=说明  $2=命令
+    if eval "$2" >/dev/null 2>&1; then
+        ok "$1"
+        CHK_PASS=$((CHK_PASS + 1))
+    else
+        warn "$1"
+        CHK_FAIL=$((CHK_FAIL + 1))
+    fi
+}
+
+chk "认证保活服务在运行"  "pgrep -f '$AUTH_BIN'"
+
+if [ "$UA2F_OK" = "1" ]; then
+    # ua2f 的 /etc/config/ua2f 里 enabled 默认是 0，start_service 会直接 return 1。
+    # 所以这里必须实测进程，不能只看包装没装上。
+    chk "UA2F 进程在运行（enabled=1 已生效）" "pgrep -f /usr/bin/ua2f"
+    if [ "$FW_STACK" = "fw4" ]; then
+        chk "UA2F nft 规则表已加载（table inet ua2f）" "nft list table inet ua2f"
+    fi
+fi
+
+chk "流量卸载已关闭"      "[ \"\$(uci -q get firewall.@defaults[0].flow_offloading)\" != \"1\" ]"
+
+if [ "$FW_STACK" = "fw4" ]; then
+    chk "TTL 规则已加载"  "nft list ruleset | grep -q campus_ttl"
+    chk "NTP 劫持已加载"  "nft list ruleset | grep -q campus_ntp"
+else
+    chk "TTL 规则已加载"  "iptables -t mangle -S POSTROUTING | grep -q TTL"
+fi
+
+# 代理软件会劫持 80/443，让 UA2F 抓不到明文 HTTP；mwan3 / QoS 还可能占用
+# connmark，与 UA2F 的 43 / 44 标记冲突。这是「装完仍被检测」的头号原因。
+for _p in clash mihomo sing-box xray hysteria mwan3 passwall shellcrash ssrplus; do
+    if pgrep -f "$_p" >/dev/null 2>&1; then
+        warn "检测到代理/多拨组件正在运行：$_p"
+        warn "  它会劫持 80/443 并可能占用 connmark，可能导致 UA2F 失效。"
+        warn "  测试时先停掉它，或在它的规则里放行校园网内网网段。"
+        warn "  若确认是 connmark 冲突，可执行下面这条后重启 UA2F："
+        warn "    uci set ua2f.main.disable_connmark=1 && uci commit ua2f && /etc/init.d/ua2f restart"
+    fi
+done
+
+if [ "$UA2F_OK" != "1" ]; then
+    warn "UA2F 未安装 —— TTL 与 NTP 仍生效，但明文 HTTP 的 UA 特征不会被抹除"
+    CHK_FAIL=$((CHK_FAIL + 1))
+fi
+
+printf '\n'
+if [ "$CHK_FAIL" -eq 0 ]; then
+    ok "自检全部通过（共 $CHK_PASS 项）"
+else
+    warn "自检有 $CHK_FAIL 项未通过（通过 $CHK_PASS 项），请按上面的提示逐条排查"
+fi
+
 # ------------------------------------------------- 汇总 -----------------
 printf '\n'
 printf '%b============================================================%b\n' "$C_G" "$C_N"
@@ -684,6 +745,8 @@ cat <<INFO
    手动登录     : $AUTH_BIN login
    查看日志     : logread -e campus-auth | tail -n 30
    重启服务     : $INIT_SCRIPT restart
+   检查 UA2F    : pgrep -f /usr/bin/ua2f && nft list table inet ua2f
+                  （前者无输出 = 进程没跑；后者报错 = 规则没加载）
 
  验证是否成功（用内网任意设备）
    1) TTL  : ping 223.5.5.5   —— 回显 TTL 应为 $TTL_SET
