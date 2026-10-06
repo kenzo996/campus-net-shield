@@ -53,6 +53,11 @@
 > 分别能在 base / packages / core 源中找到，**依赖完全可满足**。
 > 也就是说在这类固件上 `opkg install ua2f` 一步到位，压根用不到官方 ipk。
 > 脚本的「三级降级」里第一级就会命中，后面两级只是保险。
+>
+> 另外，该包的 `/etc/config/ua2f` 里 `enabled` 默认是 `0`，装完**不会自动启用**，
+> 包会打印 `UA2F disabled. You should enable it manually.`。初始化脚本
+> 在 `enabled != 1` 时直接 `return 1`，连 `table inet ua2f` 都不会创建。
+> 这是上游设计，不是安装失败。脚本会自动写入 `enabled=1` 并重启服务。
 
 ---
 
@@ -176,6 +181,12 @@ wget -O /tmp/cns.sh https://cdn.jsdelivr.net/gh/<你的用户名>/<仓库名>@ma
 logread -e campus-auth | tail -n 30
 ```
 
+检查 UA2F 是否真的在跑（进程 + 防火墙规则，两个都要有输出）：
+
+```
+pgrep -f /usr/bin/ua2f && nft list table inet ua2f
+```
+
 重启保活服务：
 
 ```
@@ -214,14 +225,43 @@ wget -O /tmp/cns-uninstall.sh https://gh-proxy.com/https://raw.githubusercontent
 
 **Q：装完还是被检测到多设备？**
 
-按顺序排查：
+安装结束时脚本会打印一段「安装结果自检」，**先看那里**，它会直接告诉你哪一环没通，
+并自动检测代理组件冲突。要人工核对的话按这个顺序：
 
-1. 确认流量卸载真的关了。`uci get firewall.@defaults[0].flow_offloading` 应该返回 `0`。
-   卸载会绕过防火墙和 CPU，UA2F 直接抓不到包。
-2. 确认没有代理软件抢 80/443 端口。OpenClash / PassWall / ShellCrash 之类会劫持流量导致 UA2F 失效，
-   测试时先停掉，或在代理规则里放行校园网内网网段。
-3. 用 `nft list ruleset | grep -A 4 campus_ttl` 确认 TTL 规则真的加载了。
-4. 如果以上都对还是掉线，说明学校用了更深的检测（时钟偏移 / 行为分析），本方案无法覆盖。
+**① UA2F 到底跑起来没有** —— 这是最常出问题的一环：
+
+```
+pgrep -f /usr/bin/ua2f ; nft list table inet ua2f
+```
+
+前者没输出 = 进程没在运行；后者报错 = 防火墙规则没加载。
+
+> 注意：`opkg install ua2f` 装完**默认是停用状态**，包会提示
+> `UA2F disabled. You should enable it manually.` —— 上游设计如此，不是装坏了。
+> 它的 `/etc/config/ua2f` 里 `enabled` 默认是 `0`，初始化脚本检测到就立刻 `return 1`，
+> 连防火墙规则都不会建。脚本会替你打开它。手工修复：
+
+```
+uci set ua2f.enabled.enabled=1 && uci commit ua2f && /etc/init.d/ua2f enable && /etc/init.d/ua2f restart
+```
+
+**② 确认流量卸载真的关了。** `uci get firewall.@defaults[0].flow_offloading` 应该返回 `0`。
+卸载会绕过防火墙和 CPU，UA2F 直接抓不到包。
+
+**③ 确认没有代理软件抢 80/443 端口。** OpenClash / PassWall / ShellCrash 之类会劫持流量
+导致 UA2F 失效，测试时先停掉，或在代理规则里放行校园网内网网段。
+
+**④ 检查 connmark 冲突。** UA2F 会给 80 端口打 `connmark 44`、并跳过 `connmark 43` 的流。
+如果路由器上跑着 mwan3、QoS 或多线路分流，可能占用相同的连接标记，导致 UA2F 抓不到包。
+关掉它的 connmark 逻辑（代价：所有 TCP 都进 NFQUEUE，性能略降但更干净）：
+
+```
+uci set ua2f.main.disable_connmark=1 && uci commit ua2f && /etc/init.d/ua2f restart
+```
+
+**⑤ 确认 TTL 规则真的加载了。** `nft list ruleset | grep -A 4 campus_ttl`
+
+以上都正常还是掉线，说明学校用了更深的检测（时钟偏移 / 行为分析），本方案无法覆盖。
 
 **Q：Kwrt / ImmortalWrt 这类第三方固件上装不上 UA2F？**
 
