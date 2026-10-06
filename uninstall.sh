@@ -87,7 +87,20 @@ case "${RESP:-y}" in
     [Nn]*) info "保留 UA2F" ;;
     *)
         if [ "$PKG_MGR" = "opkg" ]; then
-            opkg remove ua2f >/dev/null 2>&1 && ok "UA2F 已卸载（opkg）" || warn "opkg 卸载 UA2F 失败"
+            # luci-app-ua2f 依赖 ua2f（安装时用 CNS_WITH_LUCI=1 可能装过），
+            # 不先卸掉它，opkg 会因为反向依赖而拒绝卸载 ua2f。
+            if opkg list-installed 2>/dev/null | grep -q '^luci-app-ua2f '; then
+                opkg remove luci-app-ua2f >/dev/null 2>&1 \
+                    && ok "已卸载 luci-app-ua2f" \
+                    || warn "luci-app-ua2f 卸载失败，忽略"
+            fi
+            if opkg remove ua2f >/dev/null 2>&1; then
+                ok "UA2F 已卸载（opkg）"
+            elif opkg remove --force-depends ua2f >/dev/null 2>&1; then
+                ok "UA2F 已卸载（opkg，--force-depends）"
+            else
+                warn "opkg 卸载 UA2F 失败（可能仍有包依赖它）"
+            fi
         elif [ "$PKG_MGR" = "apk" ]; then
             apk del ua2f >/dev/null 2>&1 && ok "UA2F 已卸载（apk）" || warn "apk 未管理 ua2f"
         fi
