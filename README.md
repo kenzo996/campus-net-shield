@@ -33,6 +33,19 @@
 
 > OpenWrt 25.12 起包管理器从 opkg 换成了 apk，`.ipk` 无法直接安装。脚本会自动识别并改用解包提取二进制的方式，但仍可能出现依赖不匹配，遇到问题见下面的 FAQ。
 
+### 第三方固件（Kwrt / ImmortalWrt / LEDE 等）
+
+这类固件的 opkg 源是自建的，内核也是自行编译的，**官方 UA2F ipk 的依赖不一定能直接满足**。
+脚本按下面三级顺序尝试安装：
+
+1. 直接从固件自建源装 `ua2f` —— 最稳，依赖与内核模块版本天然匹配
+2. 下载官方 ipk，逐个补齐依赖后再装
+3. 仍失败则用 `opkg install --force-depends` 强制安装，并提示缺库风险
+
+**`mips` / `mipsel` 平台（如 `ramips/mt7621`）额外需要 `libatomic`**，脚本会根据
+`DISTRIB_ARCH` 自动加入依赖清单。UA2F 在 fw4 环境下还需要 `kmod-nft-queue`，
+这类内核模块必须与内核版本匹配，第三方固件务必走自己的源。
+
 ---
 
 ## 原理
@@ -158,6 +171,33 @@ wget -O /tmp/cns-uninstall.sh https://raw.githubusercontent.com/<你的用户名
    测试时先停掉，或在代理规则里放行校园网内网网段。
 3. 用 `nft list ruleset | grep -A 4 campus_ttl` 确认 TTL 规则真的加载了。
 4. 如果以上都对还是掉线，说明学校用了更深的检测（时钟偏移 / 行为分析），本方案无法覆盖。
+
+**Q：Kwrt / ImmortalWrt 这类第三方固件上装不上 UA2F？**
+
+先确认自建源可用：
+
+```
+opkg update
+```
+
+再看源里有没有 ua2f：
+
+```
+opkg list | grep -i ua2f
+```
+
+有的话直接装，**不要用官方 ipk** —— 自建源的包与内核模块版本是匹配的：
+
+```
+opkg install ua2f
+```
+
+源里没有才会退回官方 ipk，此时常见失败原因是缺 `libatomic`（mips/mipsel 平台）
+或 `kmod-nft-queue` 与内核版本不匹配。可以先手动补依赖再装：
+
+```
+opkg install libatomic kmod-nfnetlink-queue kmod-nft-queue libnetfilter-queue
+```
 
 **Q：`opkg install ua2f.ipk` 报依赖缺失？**
 
