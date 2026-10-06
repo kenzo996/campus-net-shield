@@ -16,11 +16,17 @@
 #  在 OpenWrt 路由器上以 root 执行：
 #     wget -O /tmp/cns.sh https://raw.githubusercontent.com/<用户名>/<仓库>/main/install.sh
 #     sh /tmp/cns.sh
+#
+#  如果 raw.githubusercontent.com 被重置（wget 报 "Unable to establish SSL
+#  connection"），换加速通道拉取，任选一条：
+#     wget -O /tmp/cns.sh https://gh-proxy.com/https://raw.githubusercontent.com/<用户名>/<仓库>/main/install.sh
+#     wget -O /tmp/cns.sh https://ghproxy.net/https://raw.githubusercontent.com/<用户名>/<仓库>/main/install.sh
+#     wget -O /tmp/cns.sh https://cdn.jsdelivr.net/gh/<用户名>/<仓库>@main/install.sh
 # ============================================================================
 
 set -u
 
-SCRIPT_VER="1.0.0"
+SCRIPT_VER="1.1.0"
 
 CONF_FILE="/etc/campus-net.conf"
 AUTH_BIN="/usr/bin/campus-auth"
@@ -246,23 +252,57 @@ ua2f_asset_for() {
     printf 'ua2f_%s_%s-%s.ipk' "$_rev" "$2" "$_base"
 }
 
-# CNS_GH_MIRROR 可选：给 GitHub 加速前缀，例如 https://ghfast.top
-GH_PREFIX="${CNS_GH_MIRROR:-}"
+# GitHub 在国内经常被连接重置（表现为 wget 报 "Unable to establish SSL connection"）。
+# 这里准备一组加速通道，按顺序轮试；任一通道成功即停。
+# 可用 CNS_GH_MIRROR 指定自己的前缀（会排在最前面试）：
+#     CNS_GH_MIRROR=https://ghfast.top/ sh install.sh
+GH_MIRROR_LIST="https://gh-proxy.com/ https://ghproxy.net/ https://ghfast.top/"
+
+# $1=原始 https://... 地址 -> 输出所有候选（自定义前缀 > 直连 > 内置通道），空格分隔
+gh_candidates() {
+    if [ -n "${CNS_GH_MIRROR:-}" ]; then
+        printf '%s ' "${CNS_GH_MIRROR}${1}"
+    fi
+    printf '%s ' "$1"
+    for _m in $GH_MIRROR_LIST; do
+        printf '%s ' "${_m}${1}"
+    done
+    printf '\n'
+}
+
+# $1=原始地址  $2=输出文件；任一通道成功返回 0
+gh_download() {
+    for _u in $(gh_candidates "$1"); do
+        if curl -fL -k --connect-timeout 12 -m 180 -o "$2" "$_u" 2>/dev/null \
+           && [ -s "$2" ]; then
+            _via="${_u%"$1"}"
+            [ -n "$_via" ] && info "下载通道: $_via"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# $1=API 地址 -> 打印 JSON 正文（同样走通道轮试）
+gh_api_json() {
+    for _u in $(gh_candidates "$1"); do
+        _j=$(curl -fsL -k --connect-timeout 12 -m 60 "$_u" 2>/dev/null)
+        if [ -n "$_j" ]; then printf '%s' "$_j"; return 0; fi
+    done
+    return 1
+}
 
 ua2f_download() {
     # $1=asset 名  $2=输出路径
     _asset="$1"; _out="$2"
-    _primary="${GH_PREFIX}https://github.com/${UA2F_REPO}/releases/latest/download/${_asset}"
-    if curl -fL -k --connect-timeout 15 -m 180 -o "$_out" "$_primary" 2>/dev/null; then
+    if gh_download "https://github.com/${UA2F_REPO}/releases/latest/download/${_asset}" "$_out"; then
         return 0
     fi
-    info "直链下载失败，改用 GitHub API 解析真实地址 ..."
-    _json=$(curl -fsL -k --connect-timeout 15 -m 60 \
-            "https://api.github.com/repos/${UA2F_REPO}/releases/latest" 2>/dev/null)
-    [ -n "$_json" ] || return 1
+    info "各下载通道均失败，改用 GitHub API 解析真实地址 ..."
+    _json="$(gh_api_json "https://api.github.com/repos/${UA2F_REPO}/releases/latest")" || return 1
     _url=$(printf '%s' "$_json" | grep -o "https://[^\"]*${_asset}" | head -n1)
     [ -n "$_url" ] || return 1
-    curl -fL -k --connect-timeout 15 -m 180 -o "$_out" "$_url" 2>/dev/null
+    gh_download "$_url" "$_out"
 }
 
 UA2F_OK=0
@@ -278,6 +318,10 @@ if [ "$PKG_MGR" = "opkg" ]; then
     if opkg install ua2f >/dev/null 2>&1; then
         UA2F_OK=1
         ok "UA2F 已从固件软件源安装（依赖自动匹配，这是最稳的路径）"
+        # 可选：源里若带 LuCI 界面则一并装上。默认不装，设 CNS_WITH_LUCI=1 开启。
+        if [ "${CNS_WITH_LUCI:-0}" = "1" ] && opkg install luci-app-ua2f >/dev/null 2>&1; then
+            ok "已附带安装 luci-app-ua2f（可在「服务 → UA2F」查看运行状态）"
+        fi
     else
         info "固件源里没有 ua2f，改为下载官方 ipk"
     fi
@@ -296,7 +340,9 @@ if [ "$UA2F_OK" != "1" ] && [ -n "$UA2F_ASSET" ]; then
             # 关键点：mips / mipsel 平台额外需要 libatomic，缺它必然装不上。
             UA2F_DEPS="libnetfilter-queue libnetfilter-conntrack kmod-nfnetlink-queue libpthread libuci ip-full"
             case "$OWRT_ARCH" in
-                *mips*) UA2F_DEPS="$UA2F_DEPS libatomic" ;;
+                # libatomic 是官方包的依赖名；第三方固件（如 Kwrt）里叫 libatomic1。
+                # 两个都试，装不上的那个会被忽略，不影响后续流程。
+                *mips*) UA2F_DEPS="$UA2F_DEPS libatomic libatomic1" ;;
             esac
             if [ "$FW_STACK" = "fw4" ]; then
                 UA2F_DEPS="$UA2F_DEPS kmod-nft-queue"
