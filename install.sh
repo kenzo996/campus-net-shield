@@ -138,8 +138,16 @@ detect_wan_if() {
 
 WAN_IF_DETECTED="$(detect_wan_if)"
 
+case "${DISTRIB_ID:-OpenWrt}" in
+    OpenWrt) FW_VENDOR="OpenWrt 官方" ;;
+    *)       FW_VENDOR="${DISTRIB_ID}（第三方固件，依赖与内核模块来自其自建源）" ;;
+esac
+KERNEL_VER="$(uname -r 2>/dev/null || echo unknown)"
+
 info "固件      : $OWRT_DESC"
+info "固件来源  : $FW_VENDOR"
 info "版本      : $OWRT_VER"
+info "内核      : $KERNEL_VER"
 info "架构      : ${OWRT_ARCH:-未知}"
 info "目标平台  : $OWRT_TARGET"
 info "包管理器  : $PKG_MGR"
@@ -260,38 +268,63 @@ ua2f_download() {
 UA2F_OK=0
 UA2F_ASSET=""
 
+# 第一步：优先从固件自身的软件源安装。
+# 第三方固件（Kwrt / ImmortalWrt / LEDE 等）自带自建源，若源里已有 ua2f，
+# 其依赖与内核模块版本天然匹配，比用官方 ipk 可靠得多。
+if [ "$PKG_MGR" = "opkg" ]; then
+    info "更新软件源索引（可能较慢）..."
+    opkg update >/dev/null 2>&1 || warn "opkg update 失败，第三方固件请确认自建源可用"
+    info "尝试从固件源安装 ua2f ..."
+    if opkg install ua2f >/dev/null 2>&1; then
+        UA2F_OK=1
+        ok "UA2F 已从固件软件源安装（依赖自动匹配，这是最稳的路径）"
+    else
+        info "固件源里没有 ua2f，改为下载官方 ipk"
+    fi
+fi
+
 # 注意：函数在版本不匹配时不输出任何内容，用「输出是否为空」判断
 UA2F_ASSET="$(ua2f_asset_for "$OWRT_VER" "$OWRT_ARCH" 2>/dev/null)"
 
-if [ -n "$UA2F_ASSET" ]; then
+if [ "$UA2F_OK" != "1" ] && [ -n "$UA2F_ASSET" ]; then
     info "下载 $UA2F_ASSET ..."
-    if ua2f_download "$UA2F_ASSET" "$TMP_DIR/ua2f.ipk"; then
+    if ua2f_download "$UA2F_ASSET" "/tmp/ua2f.ipk"; then
         ok "下载完成"
 
         if [ "$PKG_MGR" = "opkg" ]; then
+            # 依赖清单取自 UA2F 的 OpenWrt 包定义。
+            # 关键点：mips / mipsel 平台额外需要 libatomic，缺它必然装不上。
+            UA2F_DEPS="libnetfilter-queue libnetfilter-conntrack kmod-nfnetlink-queue libpthread libuci ip-full"
+            case "$OWRT_ARCH" in
+                *mips*) UA2F_DEPS="$UA2F_DEPS libatomic" ;;
+            esac
             if [ "$FW_STACK" = "fw4" ]; then
-                opkg install iptables-nft kmod-nfnetlink-queue >/dev/null 2>&1
+                UA2F_DEPS="$UA2F_DEPS kmod-nft-queue"
             else
-                opkg install iptables-mod-nfqueue kmod-nfnetlink-queue >/dev/null 2>&1
+                UA2F_DEPS="$UA2F_DEPS iptables-mod-nfqueue iptables-mod-filter iptables-mod-conntrack-extra"
             fi
 
-            if opkg install "$TMP_DIR/ua2f.ipk" >/dev/null 2>&1; then
+            info "补齐 UA2F 依赖（逐个安装，源里没有的自动跳过）..."
+            for _d in $UA2F_DEPS; do
+                opkg install "$_d" >/dev/null 2>&1 || true
+            done
+
+            if opkg install /tmp/ua2f.ipk >/dev/null 2>&1; then
                 UA2F_OK=1
-                ok "UA2F 安装成功（opkg）"
+                ok "UA2F 安装成功"
             else
-                warn "opkg 安装失败，尝试补装依赖后重试 ..."
-                opkg install libnetfilter-queue kmod-nfnetlink-queue >/dev/null 2>&1
-                if opkg install "$TMP_DIR/ua2f.ipk" >/dev/null 2>&1; then
+                warn "常规安装失败，改用 --force-depends 强制安装 ..."
+                if opkg install --force-depends /tmp/ua2f.ipk >/dev/null 2>&1; then
                     UA2F_OK=1
-                    ok "UA2F 安装成功（opkg，二次尝试）"
+                    warn "已强制安装。若 UA2F 启动异常，多半是缺库，请核对上面的依赖清单"
                 else
-                    warn "UA2F 安装失败，稍后可手动处理"
+                    warn "UA2F 安装失败"
                 fi
             fi
         else
             # OpenWrt 25.12+ 使用 apk，.ipk 不能直装，改为解包提取二进制
             warn "本机使用 apk（OpenWrt 25.12+），改用「解包二进制」方式安装"
-            mkdir -p "$TMP_DIR/x" && (cd "$TMP_DIR/x" && tar -xzf "$TMP_DIR/ua2f.ipk" 2>/dev/null)
+            mkdir -p "$TMP_DIR/x" && (cd "$TMP_DIR/x" && tar -xzf /tmp/ua2f.ipk 2>/dev/null)
             if [ -f "$TMP_DIR/x/data.tar.gz" ]; then
                 mkdir -p "$TMP_DIR/x/data" && (cd "$TMP_DIR/x/data" && tar -xzf "$TMP_DIR/x/data.tar.gz" 2>/dev/null)
             fi
@@ -334,6 +367,8 @@ if [ "$UA2F_OK" = "1" ]; then
     uci -q set ua2f.enabled.enabled=1 2>/dev/null
     uci -q set ua2f.firewall.handle_fw=1 2>/dev/null
     uci -q set ua2f.firewall.handle_intranet=1 2>/dev/null
+    # 443 是加密流量，UA 在里面看不到，处理它纯属浪费 CPU
+    uci -q set ua2f.firewall.handle_tls=0 2>/dev/null
     uci -q set ua2f.main.custom_ua="$USER_AGENT" 2>/dev/null
     uci -q commit ua2f 2>/dev/null
     if [ -x /etc/init.d/ua2f ]; then
