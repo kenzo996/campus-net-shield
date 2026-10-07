@@ -1,6 +1,6 @@
 #!/bin/sh
 # ============================================================================
-#  campus-net-shield  ·  install.sh  v1.0.0
+#  campus-net-shield  ·  install.sh  v1.2.0
 #  OpenWrt 校园网「多终端检测」绕过 + eportal 自动登录 一键装机脚本
 # ----------------------------------------------------------------------------
 #  ⚠ 风险声明（务必先读）
@@ -26,7 +26,7 @@
 
 set -u
 
-SCRIPT_VER="1.1.0"
+SCRIPT_VER="1.2.0"
 
 CONF_FILE="/etc/campus-net.conf"
 AUTH_BIN="/usr/bin/campus-auth"
@@ -36,6 +36,9 @@ NFT_TTL_FILE="$NFT_DIR/12-campus-ttl.nft"
 NFT_NTP_FILE="$NFT_DIR/13-campus-ntp.nft"
 FW_USER="/etc/firewall.user"
 UA2F_REPO="Zxilly/UA2F"
+MMTLS_SH="/etc/campus-mmtls.sh"
+MMTLS_INIT="/etc/init.d/campus-mmtls"
+CRON_FILE="/etc/crontabs/root"
 TMP_DIR="/tmp/campus-net-shield.$$"
 
 # ---------------------------------------------------------------- 输出工具 --
@@ -424,6 +427,230 @@ if [ "$UA2F_OK" = "1" ]; then
     ok "UA2F 已启用"
 fi
 
+# ------------------------------------------------- 放过微信 mmtls ---------
+# 为什么必须做这一步：
+#   UA2F 的 nftables 规则最后一条是「所有非 22 / 443 的 TCP 全部送入 NFQUEUE」，
+#   而微信的 mmtls 长连接**伪装成 80 端口的 HTTP 请求**：
+#       POST /mmtls/7ae571b3 HTTP/1.1
+#       Host: dns.weixin.qq.com
+#       Upgrade: mmtls
+#       User-Agent: MicroMessenger Client
+#   UA2F 会把它当普通 HTTP 改写 User-Agent，握手随即失败 —— 症状就是
+#   「手机微信提示网络连接异常，但其他 App 都正常」。
+#
+# 上游有 handle_mmtls 选项，但作者在 README 里明确写了：
+#   「该规则仅在 iptables NFQUEUE 分支中生效，nftables 分支无效」
+# 而 22.03+ 的 OpenWrt / 第三方固件走的就是 fw4+nftables，等于没有这个绕过。
+#
+# ⚠ 关键（真机 dump 出来的规则链，顺序即执行顺序）：
+#     tcp dport 80 ... ct mark set 0x0000002c   <- 先把 80 端口的包无脑打成 connmark 44
+#     ct mark 0x0000002b ... return             <- 再来判断「43 就放行」
+#     meta l4proto tcp ... queue ... to 10010   <- 剩下的全送进 NFQUEUE
+#   也就是说，网上常见的说法「在 PREROUTING 里打 connmark 43 就能绕过」是**错的**：
+#   43 会被上面那句 set 0x2c 覆盖掉，包照样进 NFQUEUE，微信照样坏。
+#
+# 唯一有效的做法：把放行判断插到 UA2F 链条的**最前面**，早于那句 set 0x2c。
+# 所以这里必须做两件事，缺一不可：
+#   1) iptables mangle PREROUTING：用 xt_string 认出 mmtls，给这条连接打 connmark 43
+#   2) nft insert：把 `ct mark 0x2b return` 插到 table inet ua2f 队列链的首位
+#
+# 代价为零：微信的 UA 在所有设备上都是同一串 `MicroMessenger Client`，
+# 不携带任何设备差异，绕过它对「统一 UA」毫无损失。
+MMTLS_OK=0
+
+if [ "$UA2F_OK" = "1" ] && [ "${CNS_NO_MMTLS:-0}" != "1" ]; then
+    step "放过微信 mmtls（否则微信会提示网络连接异常）"
+
+    # connmark 43 的逃生口只在 disable_connmark != 1 时才会生成
+    if [ "$(uci -q get ua2f.main.disable_connmark 2>/dev/null)" = "1" ]; then
+        warn "ua2f.main.disable_connmark=1 会导致 UA2F 不生成「跳过 connmark 43」的规则"
+        warn "  本绕过将失效，已自动改回 0。"
+        warn "  如果你是为了避开 mwan3 / QoS 的 connmark 冲突才设的 1，"
+        warn "  两者只能二选一：要么微信正常，要么 connmark 不冲突。"
+        uci -q set ua2f.main.disable_connmark=0
+        uci -q commit ua2f
+        [ -x /etc/init.d/ua2f ] && /etc/init.d/ua2f restart >/dev/null 2>&1
+    fi
+
+    info "安装 xt_string / CONNMARK 支持 ..."
+    # iptables 可能已由固件提供（fw3 或预装），有就不重复装，避免与 legacy 版冲突
+    command -v iptables >/dev/null 2>&1 || pkg_install iptables-nft
+    pkg_install iptables-mod-filter iptables-mod-conntrack-extra
+
+    cat > "$MMTLS_SH" <<'MMTLS_EOF'
+#!/bin/sh
+# campus-net-shield: 让 UA2F 跳过微信 mmtls，避免微信「网络连接异常」。
+# 由 install.sh 生成。会被 firewall include / init 脚本 / 计划任务反复调用，
+# 所以必须写成幂等的。
+#
+#   campus-mmtls.sh apply    写入放行规则（默认，无参数时也是它）
+#   campus-mmtls.sh remove   清除放行规则
+#   campus-mmtls.sh status   打印状态，两项都到位时返回 0
+#
+# 无论成功失败都必须 exit 0：fw4 用 `. path`（source）方式执行 script include，
+# 退出码会被 fw4 检查，非零可能让整个防火墙重载报错 —— 那时候连网都上不了。
+# 同理这里刻意不用 set -u / set -e，避免污染被 source 进去的那个 shell。
+
+IPT="$(command -v iptables 2>/dev/null || true)"
+NFT="$(command -v nft 2>/dev/null || true)"
+
+# UA2F 约定的 connmark：「非 HTTP 流，跳过」。43 = 0x2b
+UA2F_MARK=0x2b
+UA2F_MARK_DEC=43
+u2f_table="inet ua2f"
+
+# 找出 ua2f 表里带 queue 的那条链（正常叫 postrouting）
+# 注意 nft 渲染出来是 `queue flags bypass to 10010`，没有 num 字样，别按 queue num 匹配
+u2f_chain() {
+    [ -n "$NFT" ] || return 1
+    "$NFT" list table $u2f_table 2>/dev/null \
+        | awk '/^[[:space:]]*chain[[:space:]]/{c=$2} /[[:space:]]queue[[:space:]]/{if(c){print c; exit}}'
+}
+
+# 删掉我们自己插进去的那条规则。
+# 我们插的渲染成：ct mark 0x0000002b counter packets N bytes M return
+# UA2F 自己那条带 comment "!ua2f: bypass non-http stream"，靠 comment 区分，绝不能误删。
+u2f_drop_ours() {
+    "$NFT" -a list chain $u2f_table "$1" 2>/dev/null | while IFS= read -r _l; do
+        case "$_l" in
+            *"ct mark 0x0000002b"*counter*return*) ;;
+            *) continue ;;
+        esac
+        case "$_l" in *comment*) continue ;; esac
+        _h="$(printf '%s' "$_l" | sed -n 's/.*handle \([0-9][0-9]*\).*/\1/p')"
+        [ -n "$_h" ] && "$NFT" delete rule $u2f_table "$1" handle "$_h" 2>/dev/null
+    done
+}
+
+u2f_apply() {
+    _ch="$(u2f_chain)" || return 1
+    [ -n "$_ch" ] || return 1
+    u2f_drop_ours "$_ch"
+    # insert = 插到链首，必须早于 UA2F 那句 `tcp dport 80 ct mark set 0x2c`
+    "$NFT" insert rule $u2f_table "$_ch" ct mark $UA2F_MARK counter return 2>/dev/null
+}
+
+u2f_remove() {
+    _ch="$(u2f_chain)" || return 0
+    [ -n "$_ch" ] || return 0
+    u2f_drop_ours "$_ch"
+}
+
+# 取该链的第一条规则（用来判断我们的放行规则有没有插在最前面）
+u2f_first_rule() {
+    _ch="$(u2f_chain)" || return 1
+    [ -n "$_ch" ] || return 1
+    "$NFT" list chain $u2f_table "$_ch" 2>/dev/null \
+        | awk '/hook /{f=1; next} f && NF {print; exit}'
+}
+
+# mmtls 特征串出现在 80 端口的请求行里：POST /mmtls/<hash> HTTP/1.1
+ipt_rule() {
+    printf 'PREROUTING -p tcp --dport 80 -m string --string /mmtls/ --algo bm -j CONNMARK --set-mark %s' "$UA2F_MARK_DEC"
+}
+
+ipt_apply() {
+    [ -n "$IPT" ] || return 1
+    while "$IPT" -t mangle -D $(ipt_rule) 2>/dev/null; do :; done
+    "$IPT" -t mangle -A $(ipt_rule) 2>/dev/null
+}
+
+ipt_remove() {
+    [ -n "$IPT" ] || return 0
+    while "$IPT" -t mangle -D $(ipt_rule) 2>/dev/null; do :; done
+}
+
+case "${1:-apply}" in
+    remove)
+        ipt_remove
+        u2f_remove
+        ;;
+    status|check)
+        _bad=0
+        if [ -n "$IPT" ] && "$IPT" -t mangle -S PREROUTING 2>/dev/null | grep -q mmtls; then
+            echo "  [OK] iptables: mmtls 连接会被打上 connmark $UA2F_MARK_DEC"
+        else
+            echo "  [!!] iptables: 没找到 mmtls 标记规则"
+            _bad=1
+        fi
+        case "$(u2f_first_rule 2>/dev/null)" in
+            *"ct mark 0x0000002b"*return*)
+                echo "  [OK] nft: UA2F 链首已插入放行规则" ;;
+            *)
+                echo "  [!!] nft: UA2F 链首没有放行规则，mmtls 仍会被 NFQUEUE 处理"
+                _bad=1 ;;
+        esac
+        exit $_bad
+        ;;
+    *)
+        ipt_apply
+        u2f_apply
+        ;;
+esac
+
+exit 0
+MMTLS_EOF
+    chmod 755 "$MMTLS_SH"
+
+    # 立刻生效一次
+    sh "$MMTLS_SH" apply >/dev/null 2>&1
+
+    # ① 注册成 fw4 的 include：每次防火墙 start / reload / restart 后重新应用。
+    #    依据 fw4 源码（openwrt/firewall4 · root/sbin/fw4）：
+    #      start() 里先 ACTION=start 生成并加载 ruleset，紧接着 ACTION=includes 执行脚本 include，
+    #      三条路径都会走到，所以规则不会被漏掉。
+    #      ruleset 模板只做 `flush table inet fw4`，不会动 iptables 建的 ip mangle 表。
+    #      include 脚本是被 `. path`（source）执行的，所以里面不能 return、也必须 exit 0。
+    if [ "$FW_STACK" = "fw4" ]; then
+        while uci -q delete firewall.cns_mmtls; do :; done
+        uci -q set firewall.cns_mmtls=include
+        uci -q set firewall.cns_mmtls.type='script'
+        uci -q set firewall.cns_mmtls.path="$MMTLS_SH"
+        # fw4 已把 reload 标记为 UNSUPPORTED（写了只会换来一句警告，且不影响执行）
+        # fw4_compatible 对非 /etc/firewall.user 的路径默认为真，这里写明确
+        uci -q set firewall.cns_mmtls.fw4_compatible='1'
+        uci -q commit firewall 2>/dev/null
+    fi
+
+    # ② 独立 init 脚本。ua2f 每次启动都会重建 table inet ua2f，我们插进链首的那条
+    #    放行规则随之消失，所以必须有一个「晚于 ua2f」的时机把它补回来。
+    #    START=99 就是干这个的：开机时一定排在 ua2f（通常 19 左右）之后。
+    cat > "$MMTLS_INIT" <<'MMTLS_INIT_EOF'
+#!/bin/sh /etc/rc.common
+# campus-net-shield: 开机后把「放过微信 mmtls」的放行规则补上。
+# ua2f 启动时会重建 table inet ua2f，所以本服务必须晚于它，START 取 99。
+START=99
+STOP=10
+
+start()  { [ -x /etc/campus-mmtls.sh ] && /etc/campus-mmtls.sh apply; }
+stop()   { [ -x /etc/campus-mmtls.sh ] && /etc/campus-mmtls.sh remove; }
+reload() { [ -x /etc/campus-mmtls.sh ] && /etc/campus-mmtls.sh apply; }
+MMTLS_INIT_EOF
+    chmod 755 "$MMTLS_INIT"
+    "$MMTLS_INIT" enable >/dev/null 2>&1
+    "$MMTLS_INIT" start  >/dev/null 2>&1
+
+    # ③ 计划任务兜底。上面两条覆盖不了「运行期手动重启 ua2f」——
+    #    在 LuCI 上点一下、改个配置、进程崩溃被 procd 重拉，规则都会丢。
+    #    每分钟补一次，成本可忽略（一次 nft list，必要时才插一条）。
+    if [ -d /etc/crontabs ]; then
+        touch "$CRON_FILE" 2>/dev/null
+        grep -v 'campus-mmtls' "$CRON_FILE" > "$CRON_FILE.cns" 2>/dev/null
+        mv "$CRON_FILE.cns" "$CRON_FILE" 2>/dev/null
+        printf '* * * * * %s apply >/dev/null 2>&1\n' "$MMTLS_SH" >> "$CRON_FILE"
+        /etc/init.d/cron restart >/dev/null 2>&1 || /etc/init.d/crond restart >/dev/null 2>&1
+    fi
+
+    if sh "$MMTLS_SH" status >/dev/null 2>&1; then
+        MMTLS_OK=1
+        ok "已让 UA2F 跳过微信 mmtls（iptables 打标记 + nft 链首放行）"
+    else
+        sh "$MMTLS_SH" status 2>&1 | sed 's/^/    /'
+        warn "mmtls 放行规则没写全：固件可能缺 iptables-nft / xt_string，或 ua2f 未在运行"
+        warn "  微信可能仍会提示网络连接异常。排查见 README 的 FAQ。"
+    fi
+fi
+
 # ------------------------------------------------- 关闭 NAT 流量卸载 ------
 step "关闭流量卸载（UA2F 生效的必要条件）"
 
@@ -696,6 +923,10 @@ if [ "$UA2F_OK" = "1" ]; then
     fi
 fi
 
+if [ "$UA2F_OK" = "1" ] && [ "${CNS_NO_MMTLS:-0}" != "1" ]; then
+    chk "微信 mmtls 放行规则已生效（UA2F 链首 + connmark）" "$MMTLS_SH status"
+fi
+
 chk "流量卸载已关闭"      "[ \"\$(uci -q get firewall.@defaults[0].flow_offloading)\" != \"1\" ]"
 
 if [ "$FW_STACK" = "fw4" ]; then
@@ -747,6 +978,8 @@ cat <<INFO
    重启服务     : $INIT_SCRIPT restart
    检查 UA2F    : pgrep -f /usr/bin/ua2f && nft list table inet ua2f
                   （前者无输出 = 进程没跑；后者报错 = 规则没加载）
+   微信诊断     : $MMTLS_SH status
+                  （两项都是 [OK] 才说明微信不会卡；见 README「UA2F 会弄坏微信」）
 
  验证是否成功（用内网任意设备）
    1) TTL  : ping 223.5.5.5   —— 回显 TTL 应为 $TTL_SET
