@@ -1,6 +1,6 @@
 #!/bin/sh
 # ============================================================================
-#  campus-net-shield  ·  uninstall.sh  v1.2.0
+#  campus-net-shield  ·  uninstall.sh  v1.5.0
 #  一键还原：移除认证服务、TTL / NTP 规则，恢复流量卸载与 NTP 设置
 #
 #  在 OpenWrt 路由器上以 root 执行：
@@ -74,18 +74,18 @@ uci -q commit system 2>/dev/null
 /etc/init.d/sysntpd restart >/dev/null 2>&1 || true
 ok "已关闭本地 NTP 服务"
 
-step "移除微信 mmtls 放行规则"
+step "移除 80 端口放行规则"
 
 # 顺序很重要：
 #   1) 先停掉定时补偿任务 —— 否则下面删完规则，一分钟内它又给装回来
-#   2) 再执行 remove 清规则（iptables 的 connmark 规则 + 插进 UA2F 链首的那条）
+#   2) 再执行 remove 清规则（从 UA2F 队列链首摘掉 80 端口的出入两条放行规则）
 #   3) 最后摘 firewall include
 # 反过来任何一步做错，都会出现「卸载不干净」。
 if [ -d /etc/crontabs ] && [ -f "$CRON_FILE" ]; then
     grep -v 'campus-mmtls' "$CRON_FILE" > "$CRON_FILE.cns" 2>/dev/null
     mv "$CRON_FILE.cns" "$CRON_FILE" 2>/dev/null
     /etc/init.d/cron restart >/dev/null 2>&1 || /etc/init.d/crond restart >/dev/null 2>&1
-    ok "已移除 mmtls 定时补偿任务"
+    ok "已移除 80 端口放行的定时补偿任务"
 fi
 
 if [ -x "$MMTLS_INIT" ]; then
@@ -95,7 +95,7 @@ if [ -x "$MMTLS_INIT" ]; then
 fi
 
 if [ -x "$MMTLS_SH" ]; then
-    "$MMTLS_SH" remove >/dev/null 2>&1 && ok "已清除 mmtls 放行规则（iptables + nft）"
+    "$MMTLS_SH" remove >/dev/null 2>&1 && ok "已清除 80 端口放行规则（nft）"
 fi
 
 # 先摘掉 firewall include —— 否则下一步重载防火墙时脚本会被再次调用，规则又回来了
@@ -107,17 +107,29 @@ if [ -f "$MMTLS_SH" ]; then
     rm -f "$MMTLS_SH" && ok "已删除 $MMTLS_SH"
 fi
 
-# 兜底：万一上面 remove 没跑成（脚本已被删 / 参数不认），这里再硬清一遍
-IPT="$(command -v iptables 2>/dev/null || true)"
-if [ -n "$IPT" ]; then
-    while "$IPT" -t mangle -D PREROUTING -p tcp --dport 80 \
-            -m string --string /mmtls/ --algo bm \
-            -j CONNMARK --set-mark 43 2>/dev/null; do :; done
+# 兜底：万一上面 remove 没跑成（脚本已被删 / 参数不认），这里再按 handle 硬清一遍。
+# 只删「带 counter 且不带 comment」的 tcp dport/sport 80 ... return，
+# UA2F 自带的规则一定带 comment，绝不会被误删。
+NFT_BIN="$(command -v nft 2>/dev/null || true)"
+if [ -n "$NFT_BIN" ]; then
+    _ch="$("$NFT_BIN" list table inet ua2f 2>/dev/null \
+           | awk '/^[[:space:]]*chain[[:space:]]/{c=$2} /[[:space:]]queue[[:space:]]/{if(c){print c; exit}}')"
+    if [ -n "$_ch" ]; then
+        "$NFT_BIN" -a list chain inet ua2f "$_ch" 2>/dev/null | while IFS= read -r _l; do
+            case "$_l" in
+                *"tcp dport 80"*counter*return*|*"tcp sport 80"*counter*return*) ;;
+                *) continue ;;
+            esac
+            case "$_l" in *comment*) continue ;; esac
+            _h="$(printf '%s' "$_l" | sed -n 's/.*handle \([0-9][0-9]*\).*/\1/p')"
+            [ -n "$_h" ] && "$NFT_BIN" delete rule inet ua2f "$_ch" handle "$_h" 2>/dev/null
+        done
+    fi
 fi
 
-# UA2F 的链如果还在，把插进去的那条规则按 handle 删掉。
-# 我们插的那条渲染成 `ct mark 0x0000002b counter packets N bytes M return`，
-# UA2F 自己那条带 comment，靠 comment 区分，不能误删。
+# 历史版本（v1.4.0 及更早）在 UA2F 链首插的是 `ct mark 0x2b ... return`，
+# v1.5.0 换成「80 端口整体放行」后不再插它。这里顺手把残留那条也清掉，
+# 保证从任意旧版本升级上来都能卸干净。
 NFT_BIN="$(command -v nft 2>/dev/null || true)"
 if [ -n "$NFT_BIN" ]; then
     _ch="$("$NFT_BIN" list table inet ua2f 2>/dev/null \
@@ -178,6 +190,15 @@ case "${RESP:-y}" in
             rm -f /etc/config/ua2f
             ok "已清理 UA2F 残留文件"
         fi
+        # ua2f 的规则是通过 fw4 的 script include 挂进去的；包卸载后
+        # table inet ua2f 可能还残留在内核里（procd 停服务不一定会 flush）。
+        # 这里显式删掉，避免卸载后还留着一条 NFQUEUE 规则把 80 端口送进队列
+        # ——那种状态下 ua2f 进程已经没了，所有明文 HTTP 会直接卡死。
+        if command -v nft >/dev/null 2>&1 && nft list table inet ua2f >/dev/null 2>&1; then
+            nft delete table inet ua2f 2>/dev/null && ok "已清除残留的 table inet ua2f"
+        fi
+        # 重载防火墙，确保 include 摘干净、内核里不再有任何 ua2f 痕迹
+        /etc/init.d/firewall reload >/dev/null 2>&1
         ;;
 esac
 
