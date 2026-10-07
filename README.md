@@ -68,9 +68,29 @@
 | 特征 | 网关看到什么 | 本方案怎么处理 |
 |---|---|---|
 | **TTL** | Windows 初始 128、Linux/Android 64、 iOS 255；每过一跳减 1。混着出现 = 多设备 | 出口 `postrouting` 强制写死 TTL（默认 128），消除跳数与系统差异 |
+| **IPv6** | 部分设备拿到 IPv6 后走 IPv6 出口，**绕过所有 IPv4 规则**，额外暴露一个可计数维度 | 整体关闭路由器 IPv6（该网络只有 IPv4 时这是最干净的做法） |
 | **User-Agent** | 明文 HTTP 请求头里同时出现 Windows / Android / iOS 的 UA | 装 **UA2F**，把所有未加密 HTTP 的 UA 统一成一个固定值 |
 | **NTP 请求** | 各系统默认对时服务器不同（苹果、小米、安卓各不一样） | nftables 把内网发往外部 123/UDP 的包重定向到路由器，统一由路由器对时 |
+| **MAC** | 网关只看得到 WAN 口那**一个** MAC，内网设备数不影响它 | 可选克隆（默认关闭）。**它不能把多台设备伪装成一台**，见下方说明 |
 | **IPID** | IP 标识符的递增规律能区分设备数 | 需要 `kmod-rkp-ipid` 内核模块，**本方案不含**（见 FAQ） |
+
+### 关于 MAC 克隆（必须理解，别抱错期望）
+
+网关在路由器的**上游**，它看到的源 MAC 永远是 WAN 口那一个 —— 内网挂 1 台还是 10 台，
+出口都是同一个 MAC。所以**克隆 MAC 无法让「2 台设备」变成「1 台」**，
+它只是在换这个唯一 MAC 的值。
+
+那为什么还要提供？因为部分网关会**把会话绑定在首次认证的 MAC 上**，
+此时保持出口 MAC 稳定是有意义的（换硬件、重刷固件后不至于要重新认证）。
+所以本方案把它做成**可选、默认关闭**。
+真正对抗多终端检测的是 **TTL 归一 + 关闭 IPv6**。
+
+```
+# 安装时选 y 填 MAC；装完也可以随时改：
+/etc/campus-mac.sh                                    # 查看当前 MAC
+/etc/campus-mac.sh set 84:69:93:55:95:71              # 改（同时写 uci，重启保留）
+/etc/campus-mac.sh off                                # 取消克隆
+```
 
 登录部分就是把你抓到的那个 `eportal/portal/login` 请求搬到路由器上跑：自动取 WAN 口当前 IP、定时探活、掉线自动重登。
 
@@ -318,10 +338,42 @@ pgrep -f /usr/bin/ua2f && nft list table inet ua2f
 /etc/campus-mmtls.sh apply
 ```
 
-重启保活服务：
+**开启认证保活开机自启**（默认关闭，需要时手动开）：
 
 ```
-/etc/init.d/campus-auth restart
+/etc/init.d/campus-auth enable && /etc/init.d/campus-auth start
+```
+
+开启后断线会每 60 秒自动重连；想关掉：
+
+```
+/etc/init.d/campus-auth stop && /etc/init.d/campus-auth disable
+```
+
+**开启每天凌晨 3 点自动重启**（默认关闭）：
+
+```
+echo '0 3 * * * /sbin/reboot # campus-reboot' >> /etc/crontabs/root && /etc/init.d/cron restart
+```
+
+取消：
+
+```
+sed -i '/campus-reboot/d' /etc/crontabs/root && /etc/init.d/cron restart
+```
+
+**调整 MAC 克隆**：
+
+```
+/etc/campus-mac.sh                              # 查看当前 WAN MAC
+/etc/campus-mac.sh set 84:69:93:55:95:71        # 改（写 uci，重启保留）
+/etc/campus-mac.sh off                          # 取消克隆
+```
+
+**检查 IPv6 是否真的关干净了**（应无输出）：
+
+```
+ip -6 addr show scope global
 ```
 
 改配置（账号密码、认证服务器地址等）：
@@ -330,7 +382,7 @@ pgrep -f /usr/bin/ua2f && nft list table inet ua2f
 vi /etc/campus-net.conf
 ```
 
-改完重启服务生效。
+改完执行 `/usr/bin/campus-auth login` 手动登录一次，或重启保活服务生效。
 
 ---
 
@@ -640,11 +692,13 @@ export CNS_WITH_LUCI=1 && sh /tmp/cns.sh
 
 | 文件 | 作用 |
 |---|---|
-| `install.sh` | 一键装机：探测环境 → 装 UA2F → 写 TTL/NTP 规则 → 生成认证脚本 → 注册开机自启 → 自检 |
+| `install.sh` | 一键装机：探测环境 → 装 UA2F → 关 IPv6 → 写 TTL/NTP 规则 → 生成认证脚本 → 自检 |
 | `uninstall.sh` | 一键还原，恢复到安装前状态 |
 | `/etc/campus-net.conf` | 安装后生成的配置（含账号密码） |
 | `/usr/bin/campus-auth` | 安装后生成的认证/保活脚本 |
-| `/etc/init.d/campus-auth` | 安装后生成的开机自启服务 |
+| `/etc/init.d/campus-auth` | 认证服务（**默认不启用自启**，需要时 `/etc/init.d/campus-auth enable && start`） |
+| `/etc/campus-mac.sh` | MAC 克隆管理（`show` / `set <mac>` / `off`），仅在装机时选了克隆才会生成 |
+| `/etc/sysctl.d/99-campus-noipv6.conf` | 关闭 IPv6 的持久化配置 |
 | `/etc/campus-mmtls.sh` | 80 端口放行规则的唯一执行体，`apply` / `remove` / `status` 三个子命令 |
 | `/etc/init.d/campus-mmtls` | `START=99`，开机时在 ua2f 之后把放行规则补回来 |
 | `/etc/crontabs/root` | 追加一条 `* * * * *`，运行期 ua2f 被重启时自动补偿放行规则 |
