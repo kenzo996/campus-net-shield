@@ -101,54 +101,65 @@ UA2F 会把它当成普通 HTTP，改写里面的 `User-Agent`，mmtls 握手随
 
 也就是说，所有 fw4 固件的用户都吃不到这个绕过。
 
-### 网上流传的修法是错的
+### 为什么不能靠「匹配 `/mmtls/` 字符串」来解决
 
-搜这个问题会看到一种说法：「在 `PREROUTING` 里给 mmtls 打 `connmark 43` 就行，因为
-UA2F 里有一条 `ct mark 43 → return` 的逃生口」。**这条是错的。** 把 UA2F 的链 dump
-出来看顺序就明白了（下面是真机输出，顺序即执行顺序）：
+一个自然的思路是：用 `iptables -m string --string /mmtls/` 认出 mmtls 握手包，
+给这条连接打个标记，让 UA2F 放行它。**这个思路在 v1.4.0 里实现过，实测失败。**
+把 UA2F 的链 dump 出来，看计数就明白了（真机输出）：
+
+```
+tcp dport 80 ... ct mark set 0x0000002c      counter packets 1086
+ct mark 0x0000002b ... return                counter packets 15   ← 我们插的
+ct mark 0x0000002b ... return comment "..."  counter packets 0    ← UA2F 自带的
+meta l4proto tcp ... queue ... to 10010      counter packets 1111
+```
+
+八十端口的包一千出头，被打上标记的**只有 15 个** —— 说明新版微信的 mmtls 握手包
+**已经不在明文里携带 `/mmtls/` 字样**了（握手改走 TLS 伪装 / 加密载荷）。
+靠特征串识别必然「打不完的补丁」，客户端一变就失效。
+
+### 本项目的做法：整个 80 端口从 UA2F 队列里放行
+
+不再猜微信用什么字符串，**直接把「80 端口的明文 HTTP」整体放行**，
+让 UA2F 不去碰它。这一点同时解决所有走 80 端口的 App，一劳永逸。
+
+在 `table inet ua2f` 的队列链首位插入两条（插入顺序无所谓，两条互不覆盖）：
+
+```
+tcp dport 80 counter return      # 出方向：本机/转发出去的 80 请求
+tcp sport 80 counter return      # 入方向：服务器回来的 80 响应
+```
+
+**两条都要**。只放行一个方向的话 TCP 握手能完成、数据传不动，
+症状还是「连不上」，而且极难排查。
+
+插入后的链首：
 
 ```
 chain postrouting {
     type filter hook postrouting priority mangle - 5; policy accept;
+    tcp sport 80 counter return              ← 我们插的
+    tcp dport 80 counter return              ← 我们插的
     ip daddr @localaddr_v4 ... return
-    tcp dport 22 ... return comment "!ua2f: bypass SSH"
-    tcp dport 443 ... return comment "!ua2f: bypass HTTPS"
-    tcp dport 80 ... ct mark set 0x0000002c          ← ① 先把 80 端口的包无脑打成 connmark 44
-    ct mark 0x0000002b ... return comment "!ua2f: bypass non-http stream"   ← ② 才判断「43 就放行」
-    meta l4proto tcp ct direction original ... queue flags bypass to 10010  ← ③ 剩下的进 NFQUEUE
+    ...
+    tcp dport 80 ... ct mark set 0x0000002c  ← 轮不到它了
+    ...
+    meta l4proto tcp ... queue ... to 10010  ← 80 端口也不会走到这
 }
 ```
 
-① 在 ② 前面，而且是无条件执行。你在 `PREROUTING` 打的 43，进了这条链先被 ① 覆盖成 44，
-到 ② 时已经匹配不上了，包照样落到 ③。**光打 connmark 是没用的**（`PREROUTING` 钩子确实
-早于 `postrouting` 钩子，但问题不在先后，在于标记被覆盖）。
+**代价，写清楚**：UA2F 不再改写 **80 端口** HTTP 的 `User-Agent`。
+`443` 本来就是 UA2F 直接放行的（见上面的 dump，`tcp dport 443 ... return`），
+所以实际上「被改写 UA 的流量」本来就只剩 80 端口这一小块。
 
-### 正确做法：把放行判断插到 UA2F 链条最前面
+**为什么这个代价可以接受**：
 
-必须插到 ① 之前，才轮不到它覆盖。所以本项目做两件事，缺一不可：
+1. 全互联网绝大多数流量已经是 HTTPS（443），能改写 UA 的本来就只有很小一部分；
+2. 80 端口明文 HTTP 的 UA 差异极大 —— 同一个人的浏览器和微信 UA 都不相同，
+   检测方拿它判「这是不是两台设备」本身就不可靠，网关更依赖 TTL / 连接数；
+3. 真正需要统一的是 **TTL**（本方案始终保留），不是 80 端口的 UA。
 
-1. `iptables mangle PREROUTING`：用 `xt_string` 认出 mmtls（匹配请求行里的 `/mmtls/`），
-   给这条**连接**打上 `connmark 43`
-2. `nft insert`：把 `ct mark 0x2b return` 插进 `table inet ua2f` 队列链的**首位**
-
-第 2 步是能生效的关键。插入后链首变成：
-
-```
-chain postrouting {
-    type filter hook postrouting priority mangle - 5; policy accept;
-    ct mark 0x0000002b counter packets 0 bytes 0 return    ← 我们插的，排在最前
-    ip daddr @localaddr_v4 ... return
-    ...
-```
-
-**为什么这样做零代价**：微信的 UA 在所有设备上都是同一串 `MicroMessenger Client`，
-不携带任何设备差异，绕过它对「统一 UA」这个目标毫无损失。
-
-**唯一冲突点**：这个绕过依赖 `ua2f.main.disable_connmark=0`。如果你因为 mwan3 / QoS 的
-connmark 冲突把它改成了 `1`，UA2F 就不再生成「跳过 connmark 43」的规则，本绕过随之失效
-——两者只能二选一。安装脚本检测到这种组合会自动改回 0 并提示你。
-
-不想多装这几个包，或固件里没有，可以跳过这一步（代价：微信不可用）：
+如果你的场景确实需要保留 80 端口的 UA 改写，可以跳过这一步，但代价是**微信不可用**：
 
 ```
 export CNS_NO_MMTLS=1 && sh /tmp/cns.sh
@@ -156,7 +167,7 @@ export CNS_NO_MMTLS=1 && sh /tmp/cns.sh
 
 ### 规则是怎么存活下来的
 
-UA2F 每次启动都会**删掉并重建** `table inet ua2f`，插在它链首的那条规则会随之消失。
+UA2F 每次启动都会**删掉并重建** `table inet ua2f`，插在它链首的规则会随之消失。
 所以脚本用三个时机兜底（`/etc/campus-mmtls.sh` 是唯一的执行体，`apply` / `remove` / `status`）：
 
 | 时机 | 覆盖场景 | 实现 |
@@ -174,8 +185,11 @@ ruleset 模板只做 `flush table inet fw4`，**不会** `flush ruleset`，所�
 建的 `ip mangle` 表不会被冲掉。include 脚本是被 `. path`（source）执行的，
 因此脚本内部不能 `return`，且必须 `exit 0`。
 
-不管在哪个时机被调用，`apply` 都是幂等的：先按 handle 删掉自己插过的规则
-（靠有没有 `comment` 区分，绝不误删 UA2F 自带的那条），再重新插到链首。
+不管在哪个时机被调用，`apply` 都是幂等的：先删掉自己插过的规则，再重新插到链首。
+删除时**靠有没有 `comment` 区分** —— UA2F 自带的规则一律带
+`comment "!ua2f: ..."`，我们插的都不带，所以绝不会误删 UA2F 自己的逻辑。
+（v1.5.0 起还会顺带清掉 v1.4.0 遗留的 `ct mark 0x2b ... return` 规则，
+所以从旧版本升级上来不会残留。）
 
 ---
 
@@ -290,11 +304,13 @@ logread -e campus-auth | tail -n 30
 pgrep -f /usr/bin/ua2f && nft list table inet ua2f
 ```
 
-检查微信 mmtls 放行规则是否在位（两项都要 [OK]）：
+检查 80 端口放行规则是否在位：
 
 ```
 /etc/campus-mmtls.sh status
 ```
+
+正常时输出一行 `[OK] nft: 80 端口已整体从 UA2F 队列放行（出入双向）`。
 
 手动补一次放行规则（规则被 ua2f 重启冲掉时可以这样救急）：
 
@@ -348,28 +364,22 @@ wget -O /tmp/cns-uninstall.sh https://gh-proxy.com/https://raw.githubusercontent
 
 然后杀掉微信进程重开，测一下：
 
-- **微信恢复正常** → 就是 UA2F 改坏了 mmtls，见上面的「UA2F 会弄坏微信」一节。
-  重装一次脚本即可自动修复；想手动修就执行下面四条（**一次复制一条**）：
+- **微信恢复正常** → 就是 UA2F 改坏了 80 端口的流量，见上面的「UA2F 会弄坏微信」一节。
+  重装一次脚本即可自动修复。想手动修，在路由器上执行这一条就够：
 
 ```
-opkg update && opkg install iptables-nft iptables-mod-filter iptables-mod-conntrack-extra
+nft insert rule inet ua2f postrouting tcp dport 80 counter return && nft insert rule inet ua2f postrouting tcp sport 80 counter return
 ```
 
-```
-/usr/sbin/iptables -t mangle -A PREROUTING -p tcp --dport 80 -m string --string /mmtls/ --algo bm -j CONNMARK --set-mark 43
-```
-
-```
-nft insert rule inet ua2f postrouting ct mark 0x2b counter return
-```
+然后恢复 UA2F：
 
 ```
 /etc/init.d/ua2f start
 ```
 
-> ⚠️ 第三条不能省。只做前两条是**没用的** —— 见「网上流传的修法是错的」。
-> 而且第三条会被「重启 ua2f」冲掉，正式安装脚本用计划任务每分钟补回来；
-> 手动敲的这一条重启 ua2f 后就没了。
+> ⚠️ 这两条插入会被「重启 ua2f」冲掉（ua2f 启动时会重建整张表）。
+> 正式安装脚本用三重机制自动补回来（fw4 include + 开机 init + 每分钟计划任务）；
+> 手动敲的这两条重启 ua2f 后就没了。
 
 - **微信还是不正常** → 不是 UA2F 的问题，往下看。
 
@@ -385,27 +395,27 @@ nft insert rule inet ua2f postrouting ct mark 0x2b counter return
 4. 部分校园网会对微信长连接单独限速或阻断。这种情况本方案无法解决，
    只能换手机流量或找网管。
 
-**Q：怎么确认 mmtls 绕过规则真的生效了？**
+**Q：怎么确认 80 端口放行规则真的生效了？**
 
 ```
 /etc/campus-mmtls.sh status
 ```
 
-两项都是 `[OK]` 才算生效：
+正常输出：
 
 ```
-  [OK] iptables: mmtls 连接会被打上 connmark 43
-  [OK] nft: UA2F 链首已插入放行规则
+  [OK] nft: 80 端口已整体从 UA2F 队列放行（出入双向）
 ```
 
-想看得更实在一点，直接看链首那一条的位置：
+想看得更实在一点，直接看链首那两条的位置：
 
 ```
-nft list chain inet ua2f postrouting | head -4
+nft list chain inet ua2f postrouting | head -5
 ```
 
-第一行规则必须是 `ct mark 0x0000002b ... return`，**排在 `tcp dport 80 ... ct mark set 0x2c` 前面**，
-否则就是没生效。安装脚本结束时打印的自检里也有一项专门检查它。
+链首应当能看到 `tcp dport 80 ... return` 和 `tcp sport 80 ... return` 两条，
+**排在 `tcp dport 80 ... ct mark set 0x2c` 前面**，否则就是没生效。
+安装脚本结束时打印的自检里也有一项专门检查它。
 
 **Q：微信好了，但过一阵又坏了 / 重启 ua2f 之后又坏了？**
 
@@ -415,7 +425,8 @@ nft list chain inet ua2f postrouting | head -4
 2. **UA2F 换了队列链的名字**：`nft list table inet ua2f` 里如果那条带 `queue` 的链不叫
    `postrouting`，脚本会自动识别，但如果你改过 UA2F 的配置（比如切了 REDIRECT / TPROXY
    模式），可能有别的链在队列，需要看 `status` 的输出。
-3. **有别的组件在抢 connmark**：跑 `status` 各项都 OK 但微信仍坏，见下面那条 FAQ。
+3. **ua2f 根本没在跑**：`apply` 会明确报错 `找不到 UA2F 的 queue 链`，
+   这种情况要先确认 UA2F 进程正常（`pgrep -f /usr/bin/ua2f`）。
 
 **Q：装完还是被检测到多设备？**
 
@@ -445,16 +456,23 @@ uci set ua2f.enabled.enabled=1 && uci commit ua2f && /etc/init.d/ua2f enable && 
 **③ 确认没有代理软件抢 80/443 端口。** OpenClash / PassWall / ShellCrash 之类会劫持流量
 导致 UA2F 失效，测试时先停掉，或在代理规则里放行校园网内网网段。
 
-**④ 检查 connmark 冲突。** UA2F 会给 80 端口打 `connmark 44`、并跳过 `connmark 43` 的流。
-如果路由器上跑着 mwan3、QoS 或多线路分流，可能占用相同的连接标记，导致 UA2F 抓不到包。
-关掉它的 connmark 逻辑（代价：所有 TCP 都进 NFQUEUE，性能略降但更干净）：
+**④ 检查 connmark 冲突（只影响 UA2F 本身，不影响 80 端口放行）。**
+如果路由器上跑着 mwan3、QoS 或多线路分流，它们可能占用与 UA2F 相同的连接标记
+（UA2F 用 43 / 44），导致 UA2F 抓不到包。关掉 UA2F 的 connmark 逻辑：
 
 ```
 uci set ua2f.main.disable_connmark=1 && uci commit ua2f && /etc/init.d/ua2f restart
 ```
 
-> 注意：这么做会让微信 mmtls 的放行规则同时失效（它依赖 `connmark 43` 这条逃生口）。
-> 两者只能二选一。
+> 说明：**本方案「80 端口整体放行」不依赖 connmark**（v1.4.0 那种
+> 「打 connmark 43」的做法已经废弃），所以设成 1 不会影响微信。
+> 但 UA2F 重启后表会重建，跑一次下面这条把放行规则补回来：
+>
+> ```
+> /etc/campus-mmtls.sh apply
+> ```
+>
+> 正常安装的话计划任务每分钟会自动补，不用管。
 
 **⑤ 确认 TTL 规则真的加载了，而且绑对了接口。** 光看到链存在不够 ——
 如果 `oifname` 写的是一个不存在的接口名，规则会一直「在」但一条包都不匹配：
@@ -627,7 +645,7 @@ export CNS_WITH_LUCI=1 && sh /tmp/cns.sh
 | `/etc/campus-net.conf` | 安装后生成的配置（含账号密码） |
 | `/usr/bin/campus-auth` | 安装后生成的认证/保活脚本 |
 | `/etc/init.d/campus-auth` | 安装后生成的开机自启服务 |
-| `/etc/campus-mmtls.sh` | 微信 mmtls 放行规则的唯一执行体，`apply` / `remove` / `status` 三个子命令 |
+| `/etc/campus-mmtls.sh` | 80 端口放行规则的唯一执行体，`apply` / `remove` / `status` 三个子命令 |
 | `/etc/init.d/campus-mmtls` | `START=99`，开机时在 ua2f 之后把放行规则补回来 |
 | `/etc/crontabs/root` | 追加一条 `* * * * *`，运行期 ua2f 被重启时自动补偿放行规则 |
 
