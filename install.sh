@@ -1,6 +1,6 @@
 #!/bin/sh
 # ============================================================================
-#  campus-net-shield  ·  install.sh  v1.5.0
+#  campus-net-shield  ·  install.sh  v1.6.0
 #  OpenWrt 校园网「多终端检测」绕过 + eportal 自动登录 一键装机脚本
 # ----------------------------------------------------------------------------
 #  ⚠ 风险声明（务必先读）
@@ -26,7 +26,7 @@
 
 set -u
 
-SCRIPT_VER="1.5.0"
+SCRIPT_VER="1.6.0"
 
 CONF_FILE="/etc/campus-net.conf"
 AUTH_BIN="/usr/bin/campus-auth"
@@ -40,6 +40,7 @@ MMTLS_SH="/etc/campus-mmtls.sh"
 MMTLS_INIT="/etc/init.d/campus-mmtls"
 CRON_FILE="/etc/crontabs/root"
 TMP_DIR="/tmp/campus-net-shield.$$"
+MACSH_FILE="/etc/campus-mac.sh"
 
 # ---------------------------------------------------------------- 输出工具 --
 if [ -t 1 ]; then
@@ -267,8 +268,55 @@ USER_AGENT="$(ask '统一后的 User-Agent' "$UA_DEF")"
 TTL_SET="$(ask '统一 TTL 值（128=Windows / 64=Linux）' '128')"
 case "$TTL_SET" in ''|*[!0-9]*) TTL_SET=128 ;; esac
 
+# ---- MAC 克隆 ----
+# 说明（务必理解，别抱错期望）：
+#   网关在路由器上游，它看到的是 WAN 口那一个 MAC，无论内网挂几台设备，
+#   出口 MAC 永远只有一个。所以「克隆 MAC」不会让 2 台设备变成 1 台。
+#   真正起作用的是 TTL 归一 + 关 IPv6（本脚本都做了）。
+#   但克隆本身无害，且某些按「首次认证的 MAC」绑定会话的网关需要它保持稳定，
+#   因此保留这个选项，默认关闭。
+printf '\n'
+printf '%s\n' "MAC 克隆（选填）。"
+printf '%s\n' "  注意：网关在内网协议栈之外，克隆 MAC 无法把多台设备伪装成一台，"
+printf '%s\n' "  真正起作用的是 TTL 归一。此选项仅为保持出口 MAC 稳定，可选。"
+ENABLE_MAC="n"
+MAC_CLONE=""
+if confirm '是否克隆 WAN 口 MAC？' 'n'; then
+    MAC_CLONE="$(ask '要克隆的 MAC（格式 aa:bb:cc:dd:ee:ff）' '')"
+    # 归一化：转小写、去掉冒号/连字符/点/空白，只留十六进制字符。
+    # ⚠ 不能写成 `tr -d '[:space:]-'`：busybox 的 tr 会把末尾的 `-`
+    #   当成范围符号解析，行为不可预期（实测会把冒号删不干净，导致合法 MAC 被判非法）。
+    #   拆成两步最稳。
+    MAC_CLONE="$(printf '%s' "$MAC_CLONE" | tr 'A-Z' 'a-z' | tr -d ' ' | tr -d '\t' | tr -d ':' | tr -d '-' | tr -d '.')"
+    # 校验：12 位十六进制
+    if printf '%s' "$MAC_CLONE" | grep -qE '^[0-9a-f]{12}$'; then
+        # 重新格式化成 aa:bb:cc:dd:ee:ff
+        MAC_CLONE="$(printf '%s' "$MAC_CLONE" \
+            | sed 's/\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)/\1:\2:\3:\4:\5:\6/')"
+        ENABLE_MAC="y"
+    else
+        warn "MAC 格式不合法（'$MAC_CLONE'），已跳过 MAC 克隆"
+        MAC_CLONE=""
+    fi
+fi
+
+# ---- 定时重启 / 自动保活：默认全部关闭 ----
+# 用户要求：这两项默认关闭，需要时手动改配置 / 手动执行命令。
 ENABLE_NTP="y"
 confirm '是否启用 NTP 请求劫持（推荐）' 'y' || ENABLE_NTP="n"
+
+ENABLE_AUTOSTART="n"
+printf '\n'
+printf '%s\n' "开机自启："
+printf '%s\n' "  开启后，路由器重启会自动拉起认证保活进程（推荐，但默认关闭）。"
+printf '%s\n' "  关闭时也会写入脚本和配置，需要时手动执行即可。"
+confirm '是否启用「认证保活」开机自启？' 'n' && ENABLE_AUTOSTART="y"
+
+ENABLE_REBOOT="n"
+printf '\n'
+printf '%s\n' "定时重启："
+printf '%s\n' "  每天凌晨 3 点自动重启路由器（部分校园网靠这个重置会话）。默认关闭。"
+confirm '是否启用「每天凌晨 3 点自动重启」？' 'n' && ENABLE_REBOOT="y"
 
 printf '\n'
 info "认证服务器 : $PORTAL_HOST:$PORTAL_PORT"
@@ -276,6 +324,9 @@ info "账号       : $USERNAME@$ISP"
 info "WAN 接口   : $WAN_IF"
 info "统一 TTL   : $TTL_SET"
 info "NTP 劫持   : $ENABLE_NTP"
+info "MAC 克隆   : ${ENABLE_MAC}${MAC_CLONE:+ ($MAC_CLONE)}"
+info "开机自启   : $ENABLE_AUTOSTART"
+info "凌晨重启   : $ENABLE_REBOOT"
 printf '\n'
 confirm '确认按以上配置安装？' 'y' || die "已取消"
 
@@ -752,6 +803,55 @@ MMTLS_INIT_EOF
     fi
 fi
 
+# --------------------------------------------------- 关闭 IPv6 ------------
+# 校园网普遍只发 IPv4，但路由器默认会向内网通告 IPv6，设备于是同时持有
+# IPv6 地址。一旦有 IPv6 流量出口，它就是一条**绕过所有 IPv4 规则**的通道：
+# TTL 重写（在 ip6 表里另做，但很多固件没配）、NTP 劫持、UA 处理全都管不到，
+# 还会额外暴露一个设备可被计数的维度。
+# 既然网络本身不支持 IPv6，最干净的做法就是整体关掉。
+step "关闭 IPv6（该网络只有 IPv4）"
+
+IPV6_DISABLED="n"
+# ① uci 层：不向内网分配 IPv6 地址 / 前缀
+uci -q set network.lan.ipv6='0' 2>/dev/null
+uci -q set network.wan.ipv6='0' 2>/dev/null
+# DHCP 不再下发 IPv6 相关项
+uci -q set dhcp.lan.dhcpv6='disabled' 2>/dev/null
+uci -q set dhcp.lan.ra='disabled' 2>/dev/null
+uci -q delete dhcp.lan.ra_slaac 2>/dev/null
+uci -q delete dhcp.lan.ra_flags 2>/dev/null
+# ② 网络层：关闭 IPv6 转发（内核开关）
+uci -q set network.globals.ula_prefix='' 2>/dev/null
+uci -q commit network 2>/dev/null
+uci -q commit dhcp 2>/dev/null
+
+# ③ sysctl：立即生效 + 开机保持
+cat > /etc/sysctl.d/99-campus-noipv6.conf <<'SYSCTL_EOF'
+# campus-net-shield: 该网络只有 IPv4，关闭全部 IPv6 转发与自动配置
+net.ipv6.conf.all.disable_ipv6=1
+net.ipv6.conf.default.disable_ipv6=1
+net.ipv6.conf.lo.disable_ipv6=1
+SYSCTL_EOF
+sysctl -p /etc/sysctl.d/99-campus-noipv6.conf >/dev/null 2>&1
+
+# ④ 兜底：逐接口关一遍（sysctl.d 在内核重启后生效，这里是立刻生效）
+for _i in /proc/sys/net/ipv6/conf/*/disable_ipv6; do
+    [ -w "$_i" ] && echo 1 > "$_i" 2>/dev/null
+done
+
+/etc/init.d/network reload >/dev/null 2>&1
+/etc/init.d/odhcpd restart >/dev/null 2>&1 || true
+
+# 回读断言
+_ipv6_left="$(ip -6 addr show scope global 2>/dev/null | grep -c 'inet6')"
+if [ "$_ipv6_left" -eq 0 ]; then
+    IPV6_DISABLED="y"
+    ok "IPv6 已关闭（无全局 IPv6 地址）"
+else
+    warn "仍检测到 $_ipv6_left 个全局 IPv6 地址，请手动核对：ip -6 addr"
+    warn "  若内网设备仍拿到 IPv6，检查 LuCI「网络 → 接口 → LAN → DHCP 服务器 → IPv6」"
+fi
+
 # ------------------------------------------------- 关闭 NAT 流量卸载 ------
 step "关闭流量卸载（UA2F 生效的必要条件）"
 
@@ -759,6 +859,81 @@ uci -q set firewall.@defaults[0].flow_offloading='0' 2>/dev/null
 uci -q set firewall.@defaults[0].flow_offloading_hw='0' 2>/dev/null
 uci -q commit firewall 2>/dev/null
 ok "已关闭 flow offloading"
+
+# ------------------------------------------------------- MAC 克隆 ---------
+if [ "$ENABLE_MAC" = "y" ] && [ -n "$MAC_CLONE" ]; then
+    step "克隆 WAN 口 MAC 为 $MAC_CLONE"
+
+    # 落成 uci 配置：这是持久化的正道，重启后仍生效。
+    # 不要用 `ip link set dev wan address ...` 硬改 —— 那只是运行期的，
+    # 网卡 up/down 或重启就丢，而且各家固件对 wan 段名字不一定叫 wan。
+    _mac_applied="n"
+
+    # 优先写 network.wan.macaddr（标准 OpenWrt 就是这么做的）
+    if uci -q get network.wan >/dev/null 2>&1; then
+        uci -q set network.wan.macaddr="$MAC_CLONE"
+        uci -q commit network
+        _mac_applied="uci:network.wan"
+    fi
+
+    # 设备段也可能需要（DSA 固件里 device 段与 interface 段分开）
+    # 探测该 interface 对应的 device 名
+    _dev="$(uci -q get network.wan.device 2>/dev/null || true)"
+    if [ -z "$_dev" ]; then
+        _dev="$WAN_IF"
+    fi
+    if uci -q get "network.$_dev" >/dev/null 2>&1; then
+        uci -q set "network.$_dev.macaddr=$MAC_CLONE" 
+        uci -q commit network
+        _mac_applied="$_mac_applied + uci:network.$_dev"
+    fi
+
+    # 立刻生效（不重启网络，避免断连）
+    if [ -e "/sys/class/net/$WAN_IF" ]; then
+        ip link set dev "$WAN_IF" down 2>/dev/null
+        ip link set dev "$WAN_IF" address "$MAC_CLONE" 2>/dev/null
+        ip link set dev "$WAN_IF" up 2>/dev/null
+    fi
+
+    # 回读断言：读出来必须等于目标值
+    sleep 1
+    _cur="$(cat "/sys/class/net/$WAN_IF/address" 2>/dev/null | tr 'A-Z' 'a-z')"
+    if [ "$_cur" = "$MAC_CLONE" ]; then
+        ok "WAN 口 MAC 已改为 $MAC_CLONE（来源：$_mac_applied）"
+        # 生成一个便于手动改的小脚本
+        cat > "$MACSH_FILE" <<MAC_SCRIPT_EOF
+#!/bin/sh
+# campus-net-shield: 调整 WAN 口 MAC 克隆。安装时写入的是 $MAC_CLONE
+#   campus-mac.sh show            显示当前 WAN MAC
+#   campus-mac.sh set aa:bb:...   改为指定 MAC（同时写入 uci，重启保留）
+#   campus-mac.sh off             取消克隆（清掉 uci 里的 macaddr）
+WAN_IF="$WAN_IF"
+case "\$1" in
+    set)
+        [ -n "\$2" ] || { echo "用法: \$0 set aa:bb:cc:dd:ee:ff"; exit 1; }
+        uci set network.wan.macaddr="\$2" 2>/dev/null
+        uci commit network 2>/dev/null
+        ip link set dev "\$WAN_IF" down 2>/dev/null
+        ip link set dev "\$WAN_IF" address "\$2" 2>/dev/null
+        ip link set dev "\$WAN_IF" up 2>/dev/null
+        echo "已设置 \$WAN_IF 的 MAC 为 \$2"
+        ;;
+    off)
+        uci -q delete network.wan.macaddr 2>/dev/null
+        uci commit network 2>/dev/null
+        echo "已清除 uci 中的 MAC 克隆，重启后恢复硬件 MAC"
+        ;;
+    *)
+        echo "当前 \$WAN_IF MAC: \$(cat /sys/class/net/\$WAN_IF/address 2>/dev/null)"
+        ;;
+esac
+MAC_SCRIPT_EOF
+        chmod 755 "$MACSH_FILE"
+    else
+        warn "MAC 未生效（当前 $_cur，目标 $MAC_CLONE）"
+        warn "  已写入 uci，重启网络后应生效；也可手动执行：$MACSH_FILE set $MAC_CLONE"
+    fi
+fi
 
 # -------------------------------------------------------- TTL 归一 --------
 step "统一出口 TTL 为 $TTL_SET"
@@ -999,11 +1174,15 @@ chmod 755 "$AUTH_BIN"
 ok "脚本写入 $AUTH_BIN"
 
 # ------------------------------------------------- 注册 procd 服务 -------
-step "注册开机自启服务"
+step "注册认证服务"
 
 cat > "$INIT_SCRIPT" <<'INIT_SCRIPT_EOF'
 #!/bin/sh /etc/rc.common
 # campus-net-shield: 校园网认证保活服务
+# 说明：本服务默认不 enable、也不启动。需要时手动启用：
+#     /etc/init.d/campus-auth enable && /etc/init.d/campus-auth start
+# 或只跑一次登录（不进守护进程）：
+#     /usr/bin/campus-auth login
 
 START=95
 STOP=10
@@ -1022,9 +1201,33 @@ stop_service() { :; }
 INIT_SCRIPT_EOF
 
 chmod 755 "$INIT_SCRIPT"
-"$INIT_SCRIPT" enable >/dev/null 2>&1
-"$INIT_SCRIPT" restart >/dev/null 2>&1
-ok "服务已注册并启动"
+
+# 默认关闭（用户要求）：不 enable、不 start。但 init 脚本和配置都已就位，
+# 想开就一条命令。
+"$INIT_SCRIPT" stop >/dev/null 2>&1
+"$INIT_SCRIPT" disable >/dev/null 2>&1
+if [ "$ENABLE_AUTOSTART" = "y" ]; then
+    "$INIT_SCRIPT" enable >/dev/null 2>&1
+    "$INIT_SCRIPT" restart >/dev/null 2>&1
+    ok "认证保活服务已注册并设为开机自启"
+else
+    ok "认证保活服务已注册（未启用自启，按需手动开启）"
+fi
+
+# ------------------------------------------------- 定时重启（可选） ------
+if [ "$ENABLE_REBOOT" = "y" ]; then
+    step "设置每天凌晨 3 点自动重启"
+    if [ -d /etc/crontabs ]; then
+        touch "$CRON_FILE" 2>/dev/null
+        grep -v 'campus-reboot' "$CRON_FILE" > "$CRON_FILE.cns" 2>/dev/null
+        mv "$CRON_FILE.cns" "$CRON_FILE" 2>/dev/null
+        printf '0 3 * * * /sbin/reboot # campus-reboot\n' >> "$CRON_FILE"
+        /etc/init.d/cron restart >/dev/null 2>&1 || /etc/init.d/crond restart >/dev/null 2>&1
+        ok "已设置：每天 03:00 自动重启"
+    else
+        warn "/etc/crontabs 不存在，无法设置定时重启"
+    fi
+fi
 
 # ------------------------------------------------- 首次登录测试 ----------
 step "首次登录测试"
@@ -1055,7 +1258,21 @@ chk() {
     fi
 }
 
-chk "认证保活服务在运行"  "pgrep -f '$AUTH_BIN'"
+if [ "$ENABLE_AUTOSTART" = "y" ]; then
+    chk "认证保活服务在运行"  "pgrep -f '$AUTH_BIN'"
+else
+    # 默认关闭时不检查进程，只检查脚本和配置就位
+    chk "认证脚本已就位（$AUTH_BIN）" "[ -x '$AUTH_BIN' ]"
+    chk "认证配置已就位（$CONF_FILE）" "[ -f '$CONF_FILE' ]"
+fi
+
+if [ "$ENABLE_MAC" = "y" ] && [ -n "$MAC_CLONE" ]; then
+    chk "WAN 口 MAC 已克隆为 $MAC_CLONE" \
+        "[ \"\$(cat /sys/class/net/$WAN_IF/address 2>/dev/null | tr 'A-Z' 'a-z')\" = \"$MAC_CLONE\" ]"
+fi
+
+chk "IPv6 已关闭（无全局 IPv6 地址）" \
+    "[ \"\$(ip -6 addr show scope global 2>/dev/null | grep -c inet6)\" = \"0\" ]"
 
 if [ "$UA2F_OK" = "1" ]; then
     # ua2f 的 /etc/config/ua2f 里 enabled 默认是 0，start_service 会直接 return 1。
@@ -1136,27 +1353,44 @@ cat <<INFO
 
  配置    : $CONF_FILE   （含明文密码，权限 600）
  脚本    : $AUTH_BIN
- 服务    : $INIT_SCRIPT   （开机自启，断线每 60 秒自动重连）
+ 服务    : $INIT_SCRIPT
+
+ 当前状态
+   开机自启 : $ENABLE_AUTOSTART   $([ "$ENABLE_AUTOSTART" = "y" ] && echo "（已启用）" || echo "（已关闭，需要时手动开）")
+   凌晨重启 : $ENABLE_REBOOT
+   MAC 克隆 : $ENABLE_MAC${MAC_CLONE:+  ($MAC_CLONE)}
+   IPv6     : $IPV6_DISABLED   $([ "$IPV6_DISABLED" = "y" ] && echo "（已关闭）" || echo "（未完全关闭，请核对）")
 
  常用命令
    查看在线状态 : $AUTH_BIN status
    手动登录     : $AUTH_BIN login
    查看日志     : logread -e campus-auth | tail -n 30
-   重启服务     : $INIT_SCRIPT restart
-   检查 UA2F    : pgrep -f /usr/bin/ua2f && nft list table inet ua2f
-                  （前者无输出 = 进程没跑；后者报错 = 规则没加载）
    微信诊断     : $MMTLS_SH status
-                  （两项都是 [OK] 才说明微信不会卡；见 README「UA2F 会弄坏微信」）
+
+   开启开机自启（当前关闭时）:
+     $INIT_SCRIPT enable && $INIT_SCRIPT start
+
+   开启凌晨自动重启:
+     echo '0 3 * * * /sbin/reboot # campus-reboot' >> /etc/crontabs/root
+     /etc/init.d/cron restart
+
+   调整 MAC 克隆:
+     $MACSH_FILE            # 查看当前 MAC
+     $MACSH_FILE set aa:bb:cc:dd:ee:ff
+     $MACSH_FILE off        # 取消克隆
+
+   检查 UA2F    : pgrep -f /usr/bin/ua2f && nft list table inet ua2f
 
  验证是否成功（用内网任意设备）
-   1) TTL  : ping 223.5.5.5   —— 回显 TTL 应为 $TTL_SET
-   2) UA   : 浏览器打开 http://ua-check.stagoh.com/   —— 应显示统一后的 UA
-   3) 实测 : 手机 + 电脑 + 平板同时上网，观察 24 小时是否掉线
+   1) TTL  : 内网设备 ping 223.5.5.5，记 TTL；路由器上再 ping 一次
+             —— 两者相同 = 生效；内网侧小 1 = 没生效
+   2) IPv6 : ip -6 addr show scope global   —— 应无输出
+   3) 实测 : 多台设备同时上网，观察是否掉线
 
  卸载    : 在仓库目录执行 sh uninstall.sh
 
- ⚠ 若 TTL 已统一但仍被踢，说明学校用了更深层的检测（时钟偏移 / 行为分析），
-   本方案无法覆盖。此时请停止使用，避免账号进一步被处置。
+ ⚠ 若以上都做了仍被踢，说明学校用了更深的检测（IPID / TCP 指纹 / 连接数行为分析），
+   这些在路由器层难以伪造。此时请停止使用，避免账号进一步被处置。
 
 INFO
 exit 0
