@@ -1,6 +1,6 @@
 #!/bin/sh
 # ============================================================================
-#  campus-net-shield  ·  uninstall.sh  v1.5.0
+#  campus-net-shield  ·  uninstall.sh  v1.6.0
 #  一键还原：移除认证服务、TTL / NTP 规则，恢复流量卸载与 NTP 设置
 #
 #  在 OpenWrt 路由器上以 root 执行：
@@ -18,7 +18,9 @@ NFT_NTP_FILE="$NFT_DIR/13-campus-ntp.nft"
 FW_USER="/etc/firewall.user"
 MMTLS_SH="/etc/campus-mmtls.sh"
 MMTLS_INIT="/etc/init.d/campus-mmtls"
+MACSH_FILE="/etc/campus-mac.sh"
 CRON_FILE="/etc/crontabs/root"
+SYSCTL_FILE="/etc/sysctl.d/99-campus-noipv6.conf"
 
 if [ -t 1 ]; then
     C_R='\033[1;31m'; C_G='\033[1;32m'; C_Y='\033[1;33m'; C_B='\033[1;36m'; C_N='\033[0m'
@@ -47,6 +49,53 @@ fi
 [ -f "$INIT_SCRIPT" ] && rm -f "$INIT_SCRIPT" && ok "已删除 $INIT_SCRIPT"
 [ -f "$AUTH_BIN" ]    && rm -f "$AUTH_BIN"    && ok "已删除 $AUTH_BIN"
 [ -f "$CONF_FILE" ]   && rm -f "$CONF_FILE"   && ok "已删除 $CONF_FILE"
+
+step "清理定时重启任务"
+if [ -f "$CRON_FILE" ] && grep -q 'campus-reboot' "$CRON_FILE" 2>/dev/null; then
+    grep -v 'campus-reboot' "$CRON_FILE" > "$CRON_FILE.cns" 2>/dev/null
+    mv "$CRON_FILE.cns" "$CRON_FILE" 2>/dev/null
+    /etc/init.d/cron restart >/dev/null 2>&1 || /etc/init.d/crond restart >/dev/null 2>&1
+    ok "已移除每天凌晨 3 点自动重启任务"
+else
+    info "未发现定时重启任务，跳过"
+fi
+
+step "还原 MAC 克隆"
+if [ -f "$MACSH_FILE" ]; then
+    rm -f "$MACSH_FILE" && ok "已删除 $MACSH_FILE"
+fi
+# 清掉 uci 里的 macaddr（只清我们可能写过的两处）
+_mac_cleared="n"
+if uci -q get network.wan.macaddr >/dev/null 2>&1; then
+    uci -q delete network.wan.macaddr && _mac_cleared="y"
+fi
+_wan_dev="$(uci -q get network.wan.device 2>/dev/null || echo wan)"
+if [ "$_wan_dev" != "wan" ] && uci -q get "network.$_wan_dev.macaddr" >/dev/null 2>&1; then
+    uci -q delete "network.$_wan_dev.macaddr" && _mac_cleared="y"
+fi
+if [ "$_mac_cleared" = "y" ]; then
+    uci -q commit network 2>/dev/null
+    ok "已清除 uci 中的 MAC 克隆设置（重启网络后恢复硬件 MAC）"
+else
+    info "未发现 uci 中的 MAC 克隆设置"
+fi
+
+step "恢复 IPv6"
+if [ -f "$SYSCTL_FILE" ]; then
+    rm -f "$SYSCTL_FILE" && ok "已删除 $SYSCTL_FILE"
+fi
+# uci 层还原：让 LAN/WAN 重新接受 IPv6 自动配置
+uci -q delete network.lan.ipv6 2>/dev/null
+uci -q delete network.wan.ipv6 2>/dev/null
+uci -q delete dhcp.lan.dhcpv6 2>/dev/null
+uci -q delete dhcp.lan.ra 2>/dev/null
+uci -q commit network 2>/dev/null
+uci -q commit dhcp 2>/dev/null
+# 内核开关还原（逐接口）
+for _i in /proc/sys/net/ipv6/conf/*/disable_ipv6; do
+    [ -w "$_i" ] && echo 0 > "$_i" 2>/dev/null
+done
+ok "已恢复 IPv6（需要时执行 /etc/init.d/network restart 彻底生效）"
 
 step "移除 TTL / NTP 防火墙规则"
 
