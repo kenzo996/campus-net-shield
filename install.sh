@@ -1,6 +1,6 @@
 #!/bin/sh
 # ============================================================================
-#  campus-net-shield  ·  install.sh  v1.2.0
+#  campus-net-shield  ·  install.sh  v1.4.0
 #  OpenWrt 校园网「多终端检测」绕过 + eportal 自动登录 一键装机脚本
 # ----------------------------------------------------------------------------
 #  ⚠ 风险声明（务必先读）
@@ -26,7 +26,7 @@
 
 set -u
 
-SCRIPT_VER="1.2.0"
+SCRIPT_VER="1.4.0"
 
 CONF_FILE="/etc/campus-net.conf"
 AUTH_BIN="/usr/bin/campus-auth"
@@ -145,7 +145,32 @@ detect_wan_if() {
     printf '%s' "$_i"
 }
 
+# 探测内网接口（NTP 劫持要按实际名字写，不能硬编码 br-lan）
+# 返回空格分隔的接口列表；探测不到就退回 br-lan
+detect_lan_ifs() {
+    _list=""
+    for _n in $(uci -q get network.lan.device 2>/dev/null || true) \
+              $(uci -q get network.lan.ifname 2>/dev/null || true); do
+        # uci 里可能是 "br-lan eth1" 这种列表，逐个取
+        for _x in $_n; do
+            case " $_list " in *" $_x "*) ;; *) _list="$_list $_x" ;; esac
+        done
+    done
+    # 兜底：扫一遍让网络命名空间里的网桥设备
+    if [ -z "$_list" ]; then
+        _wan="$(detect_wan_if)"
+        for _d in $(ls /sys/class/net 2>/dev/null); do
+            [ "$_d" = "$_wan" ] && continue
+            [ "$_d" = "lo" ] && continue
+            [ -d "/sys/class/net/$_d/bridge" ] && _list="$_list $_d"
+        done
+    fi
+    [ -n "$_list" ] || _list=" br-lan"
+    printf '%s' "$_list"
+}
+
 WAN_IF_DETECTED="$(detect_wan_if)"
+LAN_IF_LIST="$(detect_lan_ifs)"
 
 case "${DISTRIB_ID:-OpenWrt}" in
     OpenWrt) FW_VENDOR="OpenWrt 官方" ;;
@@ -162,6 +187,7 @@ info "目标平台  : $OWRT_TARGET"
 info "包管理器  : $PKG_MGR"
 info "防火墙栈  : $FW_STACK"
 info "WAN 接口  : $WAN_IF_DETECTED"
+info "LAN 接口  :$LAN_IF_LIST"
 
 if [ -z "$OWRT_ARCH" ]; then
     warn "读不到 DISTRIB_ARCH，UA2F 二进制可能无法自动匹配"
@@ -203,7 +229,28 @@ ISP="$(ask_choice '运营商' "$ISP_DEF" 'cmcc|unicom|telecom|none')"
 PASSWORD="$(ask_secret '上网密码')"
 [ -n "$PASSWORD" ] || die "密码不能为空"
 
-WAN_IF="$(ask 'WAN 接口名（填 auto 自动识别）' "$WAN_IF_DETECTED")"
+# WAN 接口：直接回车 = 用探测结果；也可以填 auto 或真实接口名。
+# ⚠ 必须把字面量 "auto" 翻译成探测结果。之前直接把提示语里的「填 auto 自动识别」
+#   当成了占位说明，用户真填 auto 就会被原样写进 nft 规则：
+#       oifname "auto" ip ttl set 128
+#   这条规则不会报错、不会被删、自检里「链存在」也照过，但一条包都不匹配 ——
+#   TTL 完全没归一，属于最难查的假成功。
+_wan_in="$(ask 'WAN 接口名（回车=自动识别，也可直接填接口名）' "$WAN_IF_DETECTED")"
+case "$_wan_in" in
+    ''|auto|AUTO|Auto) WAN_IF="$WAN_IF_DETECTED" ;;
+    *)                  WAN_IF="$_wan_in" ;;
+esac
+# 再兜一层：接口不存在就退回探测值
+if [ -n "$WAN_IF" ] && [ ! -e "/sys/class/net/$WAN_IF" ]; then
+    case "$WAN_IF" in
+        *.*) ;;   # VLAN 子接口（如 wan.10）不一定有 sysfs 目录，放过
+        *)
+            warn "接口 '$WAN_IF' 不存在，改用自动探测结果：$WAN_IF_DETECTED"
+            WAN_IF="$WAN_IF_DETECTED" ;;
+    esac
+fi
+[ -n "$WAN_IF" ] || die "无法确定 WAN 接口名，请手动指定"
+
 PROBE_URL="$(ask '保活探测地址' 'http://connect.rom.miui.com/generate_204')"
 UA_DEF='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36'
 USER_AGENT="$(ask '统一后的 User-Agent' "$UA_DEF")"
@@ -662,11 +709,21 @@ ok "已关闭 flow offloading"
 # -------------------------------------------------------- TTL 归一 --------
 step "统一出口 TTL 为 $TTL_SET"
 
+# ⚠ 关键：/etc/nftables.d/*.nft 确实会被 fw4 加载，但加载点是
+#   templates/ruleset.uc 里的 `include "/etc/nftables.d/*.nft"`，
+#   而那行位于 `table inet fw4 { ... }` 的**内部**（「User includes」注释处）。
+#   所以写在这里的文件必须只包含 chain 定义，**不能带自己的 table 头**，
+#   否则会嵌套出一个非法结构、整份规则加载失败。
+#   这也意味着这些链属于 table inet fw4。
+NFT_TTL_CHAIN="campus_ttl"
+
 if [ "$FW_STACK" = "fw4" ]; then
     mkdir -p "$NFT_DIR"
     cat > "$NFT_TTL_FILE" <<EOF
 # campus-net-shield: 统一出口 TTL，抹掉「经过路由跳数」特征
-chain campus_ttl {
+# 注意：本文件被 fw4 的 ruleset 模板以 include 方式加载，
+# 位置在 table inet fw4 内部，因此这里不能再写 table 头。
+chain $NFT_TTL_CHAIN {
     type filter hook postrouting priority 300; policy accept;
     oifname "$WAN_IF" ip ttl set $TTL_SET
     oifname "$WAN_IF" ip6 hoplimit set $TTL_SET
@@ -700,30 +757,62 @@ if [ "$ENABLE_NTP" = "y" ]; then
 
     if [ "$FW_STACK" = "fw4" ]; then
         mkdir -p "$NFT_DIR"
-        cat > "$NFT_NTP_FILE" <<'EOF'
-# campus-net-shield: 把内网发往外部的 NTP 请求重定向到路由器自身
-chain campus_ntp {
-    type nat hook prerouting priority dstnat; policy accept;
-    iifname "br-lan" udp dport 123 redirect
-    iifname "br-guest" udp dport 123 redirect
-}
-EOF
-        info "已写入 $NFT_NTP_FILE"
+        # 按实际探测到的内网接口生成，不硬编码 br-lan
+        {
+            printf '# campus-net-shield: 把内网发往外部的 NTP 请求重定向到路由器自身\n'
+            printf '# 同样被 include 进 table inet fw4，故只写 chain。\n'
+            printf 'chain campus_ntp {\n'
+            printf '    type nat hook prerouting priority dstnat; policy accept;\n'
+            for _li in $LAN_IF_LIST; do
+                printf '    iifname "%s" udp dport 123 redirect\n' "$_li"
+            done
+            printf '}\n'
+        } > "$NFT_NTP_FILE"
+        info "已写入 $NFT_NTP_FILE（接口:$LAN_IF_LIST）"
     elif [ "$FW_STACK" = "fw3" ]; then
         pkg_install iptables-mod-nat-extra
         touch "$FW_USER"
         sed -i '/# campus-net-shield ntp begin/,/# campus-net-shield ntp end/d' "$FW_USER" 2>/dev/null
         {
             echo "# campus-net-shield ntp begin"
-            echo "iptables -t nat -A PREROUTING -i br-lan -p udp --dport 123 -j REDIRECT --to-ports 123"
+            for _li in $LAN_IF_LIST; do
+                echo "iptables -t nat -A PREROUTING -i $_li -p udp --dport 123 -j REDIRECT --to-ports 123"
+            done
             echo "# campus-net-shield ntp end"
         } >> "$FW_USER"
         ok "已写入 $FW_USER"
     fi
 fi
 
+# 重载后必须**回读断言**，不能只看文件写成功。
+# 光写文件、规则没被加载（或接口名写错导致一条不匹配）时，
+# 「文件存在」「链存在」两种检查都会通过 —— 这就是之前 TTL 假成功的原因。
+NTF_APPLY_OK=0
 if [ -d "$NFT_DIR" ]; then
     /etc/init.d/firewall reload >/dev/null 2>&1 && ok "防火墙规则已重载"
+
+    if [ "$FW_STACK" = "fw4" ]; then
+        _bad=""
+        if ! nft list chain inet fw4 campus_ttl 2>/dev/null \
+             | grep -q "oifname \"$WAN_IF\""; then
+            _bad="$_bad TTL接口绑定"
+        fi
+        if [ "$ENABLE_NTP" = "y" ]; then
+            for _li in $LAN_IF_LIST; do
+                nft list chain inet fw4 campus_ntp 2>/dev/null \
+                    | grep -q "iifname \"$_li\"" || _bad="$_bad NTP接口($_li)"
+            done
+        fi
+        if [ -n "$_bad" ]; then
+            err "防火墙规则未按预期生效，缺：$_bad"
+            err "  TTL 未生效 = 出口 TTL 没有归一，多数学校靠这个判定多设备共享。"
+            err "  常见原因是接口名不对。当前 WAN=$WAN_IF  LAN=$LAN_IF_LIST"
+            err "  核对命令： ip link ; nft list chain inet fw4 campus_ttl"
+            NTF_APPLY_OK=0
+        else
+            NTF_APPLY_OK=1
+        fi
+    fi
 fi
 
 # ------------------------------------------------- 生成认证脚本 ----------
@@ -931,9 +1020,33 @@ chk "流量卸载已关闭"      "[ \"\$(uci -q get firewall.@defaults[0].flow_o
 
 if [ "$FW_STACK" = "fw4" ]; then
     chk "TTL 规则已加载"  "nft list ruleset | grep -q campus_ttl"
-    chk "NTP 劫持已加载"  "nft list ruleset | grep -q campus_ntp"
+    # 断言接口名绑定 —— 接口名写错时规则照样存在，只是一条包都不匹配
+    chk "TTL 规则绑定了 WAN 接口（$WAN_IF）" \
+        "nft list chain inet fw4 campus_ttl | grep -q 'oifname \"$WAN_IF\"'"
+    if [ "$ENABLE_NTP" = "y" ]; then
+        chk "NTP 劫持已加载"  "nft list ruleset | grep -q campus_ntp"
+        for _li in $LAN_IF_LIST; do
+            chk "NTP 劫持绑定了内网接口（$_li）" \
+                "nft list chain inet fw4 campus_ntp | grep -q 'iifname \"$_li\"'"
+        done
+    fi
 else
     chk "TTL 规则已加载"  "iptables -t mangle -S POSTROUTING | grep -q TTL"
+fi
+
+# 实测出口 TTL：从路由器自己 ping，收包 TTL 应当已被改写。
+# 这是唯一能证明「TTL 真的归一了」的检查，前面那些都只是看规则在不在。
+# 注意：ping 目标不同、回程跳数不同，收到的 TTL 本来就会浮动，
+# 所以这里不比绝对值，只验证「ping 通了」+ 打印实测值供人工核对。
+if command -v ping >/dev/null 2>&1; then
+    _pttl="$(ping -c 2 -W 3 223.5.5.5 2>/dev/null | sed -n 's/.*ttl=\([0-9]*\).*/\1/ip' | head -n1)"
+    if [ -n "$_pttl" ]; then
+        ok "出口连通性正常（实测收到 ttl=$_pttl，本机统一值已设为 $TTL_SET）"
+        info "  ⚠ 这个 ttl 是『对端回包』的值，随目标与跳数浮动，不等于 $TTL_SET 是正常的。"
+        info "  要验证改写是否生效，请在【内网设备】上 ping 同一目标，对比是否与网关侧一致。"
+    else
+        warn "从路由器 ping 外网无响应，无法实测 TTL（不影响规则本身）"
+    fi
 fi
 
 # 代理软件会劫持 80/443，让 UA2F 抓不到明文 HTTP；mwan3 / QoS 还可能占用
